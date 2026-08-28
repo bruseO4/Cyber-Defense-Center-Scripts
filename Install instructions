@@ -6,3 +6,6 @@ For both IP-Lookup and Stellar Airtable you will have to:
 powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File (copied file path here) 
 
 If done correctly the icon should turn into the powershell logo 
+When they run they will make there own files: 
+IP lookup script: lookup history and lookup settings 
+Stellar Airtable: Stellar Airtable Analysts

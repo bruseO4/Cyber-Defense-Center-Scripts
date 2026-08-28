@@ -6,8 +6,8 @@ As of right now the way to get the most automated:
 1. Click on the info icon for the top alert. 
 2. Go to the JSON tab
 3. Ctrl + a > ctrl + c
-4. paste into stellar 
-The way the link works is it takes your current tab and since being on JSON makes the link longer it autocuts the link at the first question mark
+4. paste into powershell script
+Note: The way the link works is it takes your current tab and since being on JSON makes the link longer it autocuts the link at the first question mark
 
 These are the categories that fill every time: 
 
@@ -29,14 +29,14 @@ These are the categories that work most of the time:
 
 MITRE Tactic 
 1. Will work if the tactic is listed in airtable
-2. If the tactic is not listed and the kill change is "Initial Attempts" it will fill in "Initial Access"
-3. If none it will be blank
+2. If the tactic is not listed and the kill chain stage is "Initial Attempts" it will fill in "Initial Access"
+3. If none of the above it will be blank
 
 Detection Type
 This is made up of if statements 
 1. If "Sophos" (not case sensitive) appears anywhere it will be an "EDR alert" this one takes priority over XDR
 2. If "XDR" (case sensitve) appears it will be a "SEIM  Correlation" 
-3. If none it will be blank
+3. If none of the above it will be blank
 
 JSON of the event
 1. The link with most JSONs is too long causing a crash so there is an if statement that will paste it if there is space

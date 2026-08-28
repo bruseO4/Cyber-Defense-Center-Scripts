@@ -35,7 +35,7 @@ MITRE Tactic
 Detection Type
 This is made up of if statements 
 1. If "Sophos" (not case sensitive) appears anywhere it will be an "EDR alert" this one takes priority over XDR
-2. If "XDR" (case sensitve) appears it will be a "SEIM Correlation" 
+2. If "XDR" (case sensitve) appears it will be a "SIEM Correlation" 
 3. If none of the above it will be blank
 
 JSON of the event

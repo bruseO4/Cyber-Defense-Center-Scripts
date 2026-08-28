@@ -40,6 +40,7 @@ This is made up of if statements
 
 JSON of the event
 1. The link with most JSONs is too long causing a crash so there is an if statement that will paste it if there is space
+Unlike the other two this one doesn't work most of the time
 
 Parts that don't work at all:
 Issue

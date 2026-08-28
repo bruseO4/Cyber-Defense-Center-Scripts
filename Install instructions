@@ -1,0 +1,8 @@
+For both IP-Lookup and Stellar Airtable you will have to: 
+1. Download the files and put them both in "Documents"
+2. In the same spot in file explorer go to new (dropdown menu) > select shortcut
+3. You will need the file path click the powershell script > copy as path (ctrl + shift + c)
+4. Paste this as the path: 
+powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File (copied file path here) 
+
+If done correctly the icon should turn into the powershell logo 

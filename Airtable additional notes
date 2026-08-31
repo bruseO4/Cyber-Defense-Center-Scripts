@@ -26,7 +26,8 @@ Source Host
 Destination Host (if no destination host is found in the json or case breakdown, it will copy the source IP)
 Analyst selection
 Supporting notes (have to fill out some parts manually)
-Issue (on 8/31 fixed with 3A trick along with desc)
+Issue (on 8/31 fixed with 3A trick along with desc and tenant)
+Tenant name:
 Description (have to fill out some parts manually)
 These are the categories that work most of the time: 
 
@@ -44,6 +45,4 @@ This is made up of if statements
 JSON of the event
 1. The link with most JSONs is too long causing a crash so there is an if statement that will paste it if there is space
 Unlike the other two this one doesn't work most of the time
-
-Tenant Name
 

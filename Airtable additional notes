@@ -1,3 +1,5 @@
+Update 8/31/26 I got desc and issue to work! 
+
 As of 8/27/26 this is the most current version of the airtable script. 
 
 In order to change the analysts names, go to line 20 and the list should be there.
@@ -24,7 +26,8 @@ Source Host
 Destination Host (if no destination host is found in the json or case breakdown, it will copy the source IP)
 Analyst selection
 Supporting notes (have to fill out some parts manually)
-
+Issue
+Description (have to fill out some parts manually)
 These are the categories that work most of the time: 
 
 MITRE Tactic 
@@ -42,7 +45,5 @@ JSON of the event
 1. The link with most JSONs is too long causing a crash so there is an if statement that will paste it if there is space
 Unlike the other two this one doesn't work most of the time
 
-Parts that don't work at all:
-Issue
 Tenant Name
-Description
+

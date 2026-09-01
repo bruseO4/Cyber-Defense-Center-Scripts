@@ -4,6 +4,133 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+# Focus Airtable's rich-text JSON editor by its accessibility name, paste the
+# complete JSON, then return to the beginning of Description. If Airtable has
+# not finished loading, retry until the timeout expires. No alert is shown if
+# focus is unavailable; the JSON remains on the clipboard for a normal Ctrl+V.
+function Set-AirtableJsonField {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$JsonText,
+
+        [int]$TimeoutSeconds = 20
+    )
+
+    if ([string]::IsNullOrWhiteSpace($JsonText)) {
+        return $false
+    }
+
+    try {
+        [System.Windows.Forms.Clipboard]::SetText($JsonText)
+    }
+    catch {
+        return $false
+    }
+
+    $airtableShell = New-Object -ComObject WScript.Shell
+    $airtableDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+
+    while ([DateTime]::UtcNow -lt $airtableDeadline) {
+        $airtableActivated = $airtableShell.AppActivate("Interface Form - Airtable")
+
+        if (-not $airtableActivated) {
+            $airtableActivated = $airtableShell.AppActivate("Google Chrome")
+        }
+
+        if ($airtableActivated) {
+            Start-Sleep -Milliseconds 350
+
+            try {
+                # Start at Chrome's focused element, then walk up to its window.
+                $airtableSearchRoot = [System.Windows.Automation.AutomationElement]::FocusedElement
+                $airtableTreeWalker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+
+                while ($null -ne $airtableSearchRoot) {
+                    $airtableParent = $airtableTreeWalker.GetParent($airtableSearchRoot)
+
+                    if ($null -eq $airtableParent -or $airtableParent.Current.ProcessId -eq 0) {
+                        break
+                    }
+
+                    $airtableSearchRoot = $airtableParent
+                }
+
+                if ($null -ne $airtableSearchRoot) {
+                    $airtableElements = $airtableSearchRoot.FindAll(
+                        [System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition
+                    )
+
+                    for ($airtableIndex = 0; $airtableIndex -lt $airtableElements.Count; $airtableIndex++) {
+                        $airtableElement = $airtableElements.Item($airtableIndex)
+
+                        try {
+                            if (
+                                $airtableElement.Current.Name -ieq "Json of the event:" -and
+                                $airtableElement.Current.IsEnabled -and
+                                $airtableElement.Current.IsKeyboardFocusable
+                            ) {
+                                $airtableElement.SetFocus()
+                                Start-Sleep -Milliseconds 150
+                                [System.Windows.Forms.SendKeys]::SendWait("^v")
+
+                                # After JSON is pasted, return to Description,
+                                # scroll it into view, and place the cursor at
+                                # the start of its leading blank lines.
+                                Start-Sleep -Milliseconds 250
+                                $airtableDescriptionElements = $airtableSearchRoot.FindAll(
+                                    [System.Windows.Automation.TreeScope]::Descendants,
+                                    [System.Windows.Automation.Condition]::TrueCondition
+                                )
+
+                                for (
+                                    $airtableDescriptionIndex = 0;
+                                    $airtableDescriptionIndex -lt $airtableDescriptionElements.Count;
+                                    $airtableDescriptionIndex++
+                                ) {
+                                    $airtableDescriptionElement = $airtableDescriptionElements.Item(
+                                        $airtableDescriptionIndex
+                                    )
+
+                                    try {
+                                        if (
+                                            $airtableDescriptionElement.Current.Name -ieq "Description:" -and
+                                            $airtableDescriptionElement.Current.IsEnabled -and
+                                            $airtableDescriptionElement.Current.IsKeyboardFocusable
+                                        ) {
+                                            $airtableDescriptionElement.SetFocus()
+                                            Start-Sleep -Milliseconds 150
+                                            [System.Windows.Forms.SendKeys]::SendWait("^{HOME}")
+                                            return $true
+                                        }
+                                    }
+                                    catch {
+                                        # Airtable can refresh Description while focus changes.
+                                    }
+                                }
+
+                                return $true
+                            }
+                        }
+                        catch {
+                            # Airtable can replace an accessibility element while loading.
+                        }
+                    }
+                }
+            }
+            catch {
+                # Keep retrying while Airtable builds the form and accessibility tree.
+            }
+        }
+
+        Start-Sleep -Milliseconds 350
+    }
+
+    return $false
+}
 
 # ============================================================
 # HOME PAGE WEBSITE SETTINGS
@@ -1302,6 +1429,18 @@ $stellarButton.Add_Click({
             $stellarFirstBrace,
             $stellarLastBrace - $stellarFirstBrace + 1
         )
+
+        <# OLD JSON URL-PREFILL PREPARATION - DISABLED
+        $stellarJsonForAirtable = $stellarJsonText.Trim()
+
+        try {
+            $stellarJsonObject = ConvertFrom-Json -InputObject $stellarJsonText -ErrorAction Stop
+            $stellarJsonForAirtable = ConvertTo-Json -InputObject $stellarJsonObject -Compress -Depth 100
+        }
+        catch {
+            $stellarJsonForAirtable = $stellarJsonText.Trim()
+        }
+        #>
     }
 
     # Source IP
@@ -1389,8 +1528,26 @@ $stellarButton.Add_Click({
 
     $stellarIssue = ""
 
-    if ($stellarText -match '(?s)^\s*\d+\s*:\s*(.*?)\s*Run Analysis') {
-        $stellarIssue = $matches[1].Trim()
+    # The case-number line can appear after copied page headers. Search from
+    # the start of any line instead of only the start of the entire paste.
+    $stellarIssueMatch = [regex]::Match(
+        $stellarText,
+        '(?ms)^\s*\d+\s*:\s*(?<Issue>.*?)\s*^\s*Run Analysis\s*$'
+    )
+
+    if ($stellarIssueMatch.Success) {
+
+        # Chrome can insert line breaks when an alert title wraps. Airtable's
+        # Issue field should receive one clean value without extra whitespace.
+        $stellarIssue = (
+            $stellarIssueMatch.Groups["Issue"].Value -replace '\s+', ' '
+        ).Trim()
+
+    }
+
+    # Fallback for Stellar layouts that copy Issue as a separate field label.
+    if (-not $stellarIssue -and $stellarText -match '(?mi)^\s*Issue\s*:?[ \t]*(?:\r?\n[ \t]*)?([^\r\n]+?)\s*$') {
+        $stellarIssue = ($matches[1] -replace '\s+', ' ').Trim()
     }
 
 
@@ -1457,13 +1614,31 @@ $stellarButton.Add_Click({
     # -----------------------------
     # TENANT NAME
     # -----------------------------
-    <#
+
     $stellarTenantName = ""
 
-    if ($stellarText -match '(?mi)^\s*Tenant:\s*(.+?)\s*$') {
-        $stellarTenantName = $matches[1].Trim()
+    # Stellar copies this field in several layouts. Try the visible label,
+    # common JSON keys, and finally the first standalone SSOC value.
+    $stellarTenantPatterns = @(
+        '(?mi)^[^\S\r\n]*Tenant[^\S\r\n]+Name[^\S\r\n]*:?[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?([^\r\n]+?)[^\S\r\n]*$',
+        '(?mi)^[^\S\r\n]*Tenant[^\S\r\n]*:?[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?([^\r\n]+?)[^\S\r\n]*$',
+        '(?i)"(?:tenant[_ ]?name|tenant)"\s*:\s*"([^"]+)"',
+        '(?mi)^[^\S\r\n]*(SSOC[^\S\r\n]*[:\-][^\r\n]+?)[^\S\r\n]*$'
+    )
+
+    foreach ($stellarTenantPattern in $stellarTenantPatterns) {
+        $stellarTenantMatch = [regex]::Match($stellarText, $stellarTenantPattern)
+
+        if ($stellarTenantMatch.Success) {
+            $stellarTenantName = ($stellarTenantMatch.Groups[1].Value -replace '\s+', ' ').Trim()
+            break
+        }
     }
-    #>
+
+    # Stellar may use "SSOC: city" while Airtable uses "SSOC-city".
+    if ($stellarTenantName -match '(?i)^SSOC\s*[:\-]\s*(.+)$') {
+        $stellarTenantName = "SSOC-$($matches[1].Trim())"
+    }
 
 
 
@@ -1537,8 +1712,9 @@ $stellarButton.Add_Click({
                     "$stellarCaseScoreBreakdown`r`n`r`n" +
                     "Recommendation:`r`n"
 
-    $stellarDescriptionText = $stellarNotesTemplate
     $stellarSupportingNotesText = $stellarNotesTemplate
+    # Description matches Supporting Notes, with three blank lines first.
+    $stellarDescriptionText = "`r`n`r`n`r`n" + $stellarSupportingNotesText
 
     # -----------------------------
     # KILL CHAIN STAGE + MITRE TACTIC
@@ -1606,7 +1782,7 @@ $stellarButton.Add_Click({
 
     if ($stellarIssue) {
         $stellarIssueEncoded = [System.Web.HttpUtility]::UrlEncode($stellarIssue)
-        $stellarParameters += "prefill_Issue=$stellarIssueEncoded"
+        $stellarParameters += "prefill_Issue%3A=$stellarIssueEncoded"
     }
 
     if ($stellarWho) {
@@ -1636,15 +1812,15 @@ $stellarButton.Add_Click({
     # Always set Escalation Required? to Mentor Review
     $stellarParameters += "prefill_Escalation+Required%3F=Mentor+Review"
 
-   <# if ($stellarTenantName) {
-        $stellarParameters += "prefill_Tenant+Name=$([uri]::EscapeDataString($stellarTenantName))"
-    } #>
-
-
-   # Description only if Case Score Breakdown exists
-    if ($stellarCaseScoreBreakdown) {
-        $stellarParameters += "prefill_Description=$([System.Web.HttpUtility]::UrlEncode($stellarDescriptionText))"
+    if ($stellarTenantName) {
+        # Airtable's exact linked-record field label is "Tenant Name:".
+        $stellarParameters += "prefill_Tenant+Name%3A=$([System.Web.HttpUtility]::UrlEncode($stellarTenantName))"
     }
+
+
+    # Airtable's exact form label is "Description:"; encode the colon in the key.
+    # Populate it every time, just like Supporting Notes.
+    $stellarParameters += "prefill_Description%3A=$([System.Web.HttpUtility]::UrlEncode($stellarDescriptionText))"
 
     # Supporting Notes should ALWAYS be populated
     $stellarParameters += "prefill_Supporting+Notes=$([System.Web.HttpUtility]::UrlEncode($stellarSupportingNotesText))"
@@ -1669,10 +1845,12 @@ $stellarButton.Add_Click({
         $stellarParameters += "prefill_Detection+Type=$([System.Web.HttpUtility]::UrlEncode($stellarDetectionType))"
     }
 
-    # Try to include JSON only if it will not make the URL too long
-    if ($stellarJsonText) {
+    <# OLD JSON URL-PREFILL METHOD - DISABLED
+    # Including JSON in the URL made long Stellar events exceed Airtable's
+    # practical URL limit. The replacement pastes JSON after the form loads.
+    if ($stellarJsonForAirtable) {
 
-        $stellarJsonParameter = "prefill_JSON+of+the+event%3A=$([System.Web.HttpUtility]::UrlEncode($stellarJsonText))"
+        $stellarJsonParameter = "prefill_JSON+of+the+event%3A=$([System.Web.HttpUtility]::UrlEncode($stellarJsonForAirtable))"
 
         # Build a test URL with JSON included
         $stellarTestParameters = $stellarParameters + $stellarJsonParameter
@@ -1680,11 +1858,15 @@ $stellarButton.Add_Click({
 
         $stellarTestUrlByteLength = [System.Text.Encoding]::UTF8.GetByteCount($stellarTestUrl)
 
-        # Keep JSON only if the complete URL stays below the safe limit
-        if ($stellarTestUrlByteLength -le 7800) {
+        # Leave extra safety room for Airtable and browser request handling.
+        if ($stellarTestUrlByteLength -le 6500) {
             $stellarParameters += $stellarJsonParameter
         }
+        else {
+            $stellarJsonNeedsManualPaste = $true
+        }
     }
+    #>
 
 
     
@@ -1709,6 +1891,32 @@ $stellarButton.Add_Click({
     # ==========================================
 
     Start-Process "chrome.exe" $stellarFinalUrl
+
+    # Copy all JSON, wait for Airtable, focus the named rich-text editor, and
+    # paste it. JSON never becomes part of the URL, so its length cannot crash
+    # the form. If focus times out, the complete JSON remains on the clipboard.
+    if ($stellarJsonText) {
+        [void](Set-AirtableJsonField -JsonText $stellarJsonText -TimeoutSeconds 20)
+    }
+
+    <# OLD OVERSIZED-JSON ALERT - DISABLED
+    if ($stellarJsonNeedsManualPaste -and $stellarJsonText) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($stellarJsonText)
+
+            [System.Windows.Forms.MessageBox]::Show(
+                "The complete JSON was too large for a safe Airtable link.`r`n`r`nThe form opened without JSON so it would not crash. The full JSON is now copied to your clipboard.`r`n`r`nClick the 'JSON of the event:' field and press Ctrl+V.",
+                "Full JSON Copied"
+            )
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "The JSON was too large for the Airtable link, and it could not be copied automatically.",
+                "JSON Copy Error"
+            )
+        }
+    }
+    #>
 
 })
 

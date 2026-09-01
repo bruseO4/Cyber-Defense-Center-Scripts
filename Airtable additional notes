@@ -34,7 +34,7 @@ JSON (got it to work with a scripting after the airtable opens)
 These are the categories that work most of the time: 
 
 MITRE Tactic 
-1. Will work if the tactic is listed in airtable
+1. Will work if the tactic is listed in airtable (now with all the mitre tactics this may work all the time)
 2. If the tactic is not listed and the kill chain stage is "Initial Attempts" it will fill in "Initial Access"
 3. If none of the above it will be blank
 

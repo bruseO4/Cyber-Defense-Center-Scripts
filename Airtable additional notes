@@ -29,6 +29,8 @@ Supporting notes (have to fill out some parts manually)
 Issue (on 8/31 fixed with 3A trick along with desc and tenant)
 Tenant name:
 Description (have to fill out some parts manually)
+JSON (got it to work with a scripting after the airtable opens)
+
 These are the categories that work most of the time: 
 
 MITRE Tactic 
@@ -42,7 +44,5 @@ This is made up of if statements
 2. If "XDR" (case sensitve) appears it will be a "SIEM Correlation" 
 3. If none of the above it will be blank
 
-JSON of the event
-1. The link with most JSONs is too long causing a crash so there is an if statement that will paste it if there is space
-Unlike the other two this one doesn't work most of the time
+
 

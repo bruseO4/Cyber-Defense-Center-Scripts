@@ -132,6 +132,146 @@ function Set-AirtableJsonField {
     return $false
 }
 
+# Find the first complete, valid JSON object or array in pasted Stellar text.
+# Braces inside quoted values are ignored, while the original indentation,
+# spaces, and line breaks are preserved for readability in Airtable.
+function Get-JsonFromText {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    for ($jsonStart = 0; $jsonStart -lt $Text.Length; $jsonStart++) {
+        $jsonOpeningCharacter = $Text[$jsonStart]
+
+        if ($jsonOpeningCharacter -ne '{' -and $jsonOpeningCharacter -ne '[') {
+            continue
+        }
+
+        $jsonDepth = 0
+        $jsonInString = $false
+        $jsonEscaped = $false
+
+        for ($jsonIndex = $jsonStart; $jsonIndex -lt $Text.Length; $jsonIndex++) {
+            $jsonCharacter = $Text[$jsonIndex]
+
+            if ($jsonInString) {
+                if ($jsonEscaped) {
+                    $jsonEscaped = $false
+                    continue
+                }
+
+                if ($jsonCharacter -eq '\') {
+                    $jsonEscaped = $true
+                    continue
+                }
+
+                if ($jsonCharacter -eq '"') {
+                    $jsonInString = $false
+                }
+
+                continue
+            }
+
+            if ($jsonCharacter -eq '"') {
+                $jsonInString = $true
+                continue
+            }
+
+            if ($jsonCharacter -eq '{' -or $jsonCharacter -eq '[') {
+                $jsonDepth++
+                continue
+            }
+
+            if ($jsonCharacter -ne '}' -and $jsonCharacter -ne ']') {
+                continue
+            }
+
+            $jsonDepth--
+
+            if ($jsonDepth -ne 0) {
+                continue
+            }
+
+            $jsonCandidate = $Text.Substring(
+                $jsonStart,
+                $jsonIndex - $jsonStart + 1
+            )
+
+            try {
+                # Validate the isolated section before using it as the event JSON.
+                $null = ConvertFrom-Json -InputObject $jsonCandidate -ErrorAction Stop
+            }
+            catch {
+                # This balanced section was not JSON. Continue looking for the
+                # next complete object or array in the pasted text.
+                break
+            }
+
+            return $jsonCandidate
+        }
+    }
+
+    return ""
+}
+
+# Recalculate and then lock the text bounds of controls that were originally
+# AutoSize. Windows Forms can repaint those controls with a smaller cached box
+# after Chrome/Airtable takes focus, which clips the ends of labels and the
+# bottom line of the private-IP reference.
+function Repair-SocToolsTextBounds {
+    param(
+        [object[]]$Controls,
+        [System.Windows.Forms.Form]$Form
+    )
+
+    if ($null -eq $Form -or $null -eq $Controls) {
+        return
+    }
+
+    $Form.SuspendLayout()
+
+    try {
+        foreach ($socControl in $Controls) {
+            if ($null -eq $socControl -or $socControl.IsDisposed) {
+                continue
+            }
+
+            # Preserve the last known-good bounds before asking Windows for a
+            # fresh preferred size. A later DPI repaint may report a smaller
+            # preferred size, but this control is never allowed to shrink.
+            $socCurrentWidth = $socControl.Width
+            $socCurrentHeight = $socControl.Height
+
+            $socControl.AutoSize = $true
+            $socPreferredSize = $socControl.PreferredSize
+            $socControl.AutoSize = $false
+
+            $socLockedWidth = [Math]::Max(
+                $socCurrentWidth,
+                $socPreferredSize.Width + 8
+            )
+            $socLockedHeight = [Math]::Max(
+                $socCurrentHeight,
+                $socPreferredSize.Height + 4
+            )
+            $socControl.Size = New-Object System.Drawing.Size(
+                $socLockedWidth,
+                $socLockedHeight
+            )
+        }
+    }
+    finally {
+        $Form.ResumeLayout($true)
+    }
+
+    $Form.Invalidate($true)
+    $Form.Update()
+}
+
 # ============================================================
 # HOME PAGE WEBSITE SETTINGS
 # ============================================================
@@ -428,10 +568,10 @@ function Stop-SocClock {
 
 $mainForm = New-Object System.Windows.Forms.Form
 $mainForm.Text = "SOC Tools"
+$mainForm.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
 $mainForm.ClientSize = New-Object System.Drawing.Size(720, 665)
 $mainForm.StartPosition = "CenterScreen"
 $mainForm.MinimumSize = New-Object System.Drawing.Size(736, 704)
-$mainForm.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 
 $tabControl = New-Object System.Windows.Forms.TabControl
 $tabControl.Dock = "Fill"
@@ -872,6 +1012,14 @@ $ipSiteChecklist.Add_MouseUp({
     $ipSiteChecklist.ClearSelected()
 })
 
+# Chrome cleanup instructions shown directly below the website checklist
+$ipCloseTabsTip = New-Object System.Windows.Forms.Label
+$ipCloseTabsTip.Text = 'Chrome tip: To close all lookup tabs, right-click the tab you want to keep, then choose "Close tabs to the right."'
+$ipCloseTabsTip.AutoSize = $false
+$ipCloseTabsTip.Size = New-Object System.Drawing.Size(650,40)
+$ipCloseTabsTip.Location = New-Object System.Drawing.Point(20,520)
+$ipCloseTabsTip.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
+
 
 # ------------------------------------------------------------
 # LOAD SAVED WEBSITE SETTINGS
@@ -1039,6 +1187,9 @@ $ipButton.FlatAppearance.MouseDownBackColor = `
 
 # Gives the private IP section a warm orange color
 $ipPrivateLabel.ForeColor = [System.Drawing.Color]::FromArgb(190,90,35)
+
+# Makes the Chrome tab-cleanup instruction readable without overpowering the form
+$ipCloseTabsTip.ForeColor = [System.Drawing.Color]::FromArgb(75,85,95)
 
 # ------------------------------------------------------------
 # LOOKUP WEBSITE SECTION
@@ -1223,6 +1374,9 @@ $ipTab.Controls.Add($ipSiteLabel)
 
 # Adds the website checklist
 $ipTab.Controls.Add($ipSiteChecklist)
+
+# Adds the Chrome tab cleanup instructions
+$ipTab.Controls.Add($ipCloseTabsTip)
 
 
 # ------------------------------------------------------------
@@ -1420,28 +1574,9 @@ $stellarButton.Add_Click({
     $stellarJsonDestinationIP = ""
     $stellarJsonHostIP = ""
 
-    # Extract everything from the first { through the last }
-    $stellarFirstBrace = $stellarText.IndexOf("{")
-    $stellarLastBrace = $stellarText.LastIndexOf("}")
-
-    if ($stellarFirstBrace -ge 0 -and $stellarLastBrace -gt $stellarFirstBrace) {
-        $stellarJsonText = $stellarText.Substring(
-            $stellarFirstBrace,
-            $stellarLastBrace - $stellarFirstBrace + 1
-        )
-
-        <# OLD JSON URL-PREFILL PREPARATION - DISABLED
-        $stellarJsonForAirtable = $stellarJsonText.Trim()
-
-        try {
-            $stellarJsonObject = ConvertFrom-Json -InputObject $stellarJsonText -ErrorAction Stop
-            $stellarJsonForAirtable = ConvertTo-Json -InputObject $stellarJsonObject -Compress -Depth 100
-        }
-        catch {
-            $stellarJsonForAirtable = $stellarJsonText.Trim()
-        }
-        #>
-    }
+    # Isolate one valid JSON value without capturing Overview or another object.
+    # Keep the JSON's original indentation and line breaks for readability.
+    $stellarJsonText = Get-JsonFromText -Text $stellarText
 
     # Source IP
     if ($stellarJsonText -match '(?i)"srcip"\s*:\s*"([^"]+)"') {
@@ -1736,14 +1871,23 @@ $stellarButton.Add_Click({
 
 
     $stellarValidMitreTactics = @(
+        "Reconnaissance",
+        "Resource Development",
         "Initial Access",
         "Execution",
         "Persistence",
         "Privilege Escalation",
+        "Stealth",
         "Defense Evasion",
         "Credential Access",
+        "Discovery",
         "Lateral Movement",
-        "Command & Control"
+        "Collection",
+        "Command & Control",
+        "Exfiltration",
+        "Impact",
+        "XDR NBA",
+        "XDR UBA"
     )
 
 
@@ -1899,6 +2043,12 @@ $stellarButton.Add_Click({
         [void](Set-AirtableJsonField -JsonText $stellarJsonText -TimeoutSeconds 20)
     }
 
+    # Chrome can return focus with stale AutoSize bounds. Refresh and lock the
+    # full text sizes before the user returns to the Home or IP Lookup tabs.
+    Repair-SocToolsTextBounds `
+        -Controls $socToolsTextBoundsControls `
+        -Form $mainForm
+
     <# OLD OVERSIZED-JSON ALERT - DISABLED
     if ($stellarJsonNeedsManualPaste -and $stellarJsonText) {
         try {
@@ -1977,6 +2127,30 @@ $tabControl.Add_SelectedIndexChanged({
         $stellarTextBox.Focus()
     }
 })
+
+$socToolsTextBoundsControls = @(
+    $homeTitle
+    $homeInstructions
+    $homeStellarCyberCheckBox
+    $homeExcelChecksheetCheckBox
+    $ipLabel
+    $ipPrivateLabel
+    $ipSiteLabel
+    $ipHistoryLabel
+)
+
+# Refresh the affected text bounds whenever SOC Tools regains focus after
+# Chrome/Airtable, including when the JSON automation times out.
+$mainForm.Add_Activated({
+    Repair-SocToolsTextBounds `
+        -Controls $socToolsTextBoundsControls `
+        -Form $mainForm
+})
+
+# Calculate the correct bounds once at startup and lock them before display.
+Repair-SocToolsTextBounds `
+    -Controls $socToolsTextBoundsControls `
+    -Form $mainForm
 
 $mainForm.AcceptButton = $homeOpenButton
 [void]$mainForm.ShowDialog()

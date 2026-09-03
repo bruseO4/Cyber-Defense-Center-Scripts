@@ -690,7 +690,7 @@ $homeOpenButton.Add_Click({
 })
 
 $homeMeetingButton = New-Object System.Windows.Forms.Button
-$homeMeetingButton.Text = "Join Team Meeting"
+$homeMeetingButton.Text = "Join Teams Meeting"
 $homeMeetingButton.Size = New-Object System.Drawing.Size(220, 45)
 $homeMeetingButton.Location = New-Object System.Drawing.Point(40, 300)
 $homeMeetingButton.BackColor = [System.Drawing.Color]::FromArgb(88, 80, 190)

@@ -283,6 +283,10 @@ $stellarCyberUrl = "https://blackswan.stellarcyber.cloud/login"
 # Stellar to Airtable tab remains configured separately below.
 $excelChecksheetUrl = "https://uscyberdefensecenter.sharepoint.com/:x:/r/sites/shadowsoc/_layouts/15/Doc.aspx?sourcedoc=%7B6491D190-06AC-47AA-BC83-B28085C6331A%7D&file=Check%20Sheet.xlsx&action=default&mobileredirect=true&wdExp=TEAMS-TREATMENT&web=1&CID=519968ED-47BA-459E-886D-90EEF46278B6"
 
+# Optional Home-page websites. Their checkboxes start unchecked.
+$googleClassroomUrl = "https://classroom.google.com/u/0/w/ODYyODI0MjY0MDEy/t/all"
+$shadowSocManualUrl = "https://uscyberdefensecenter.sharepoint.com/:w:/s/shadowsoc/IQCZurtWkRGIRamxkfitx_LjAWaN887dxBlfJXxm3lhw9Ic?isSPOFile=1&ovuser=8d281d1d-9c4d-4bf7-b16e-032d15de9f6c%2Cblj210001%40utdallas.edu&wdExp=TEAMS-TREATMENT&web=1&TeamsCID=e0de9577-dc04-4547-bb73-1383c1d7dc65&clickparams=eyJBcHBOYW1lIjoiVGVhbXMtRGVza3RvcCIsIkFwcFZlcnNpb24iOiI0OS8yNjA2MTExODIxNiJ9&linkOpenTime=1783952921482"
+
 # Paste the complete "Join Microsoft Teams Meeting" link between the quotes.
 $teamsMeetingUrl = "https://teams.microsoft.com/l/chat/19:meeting_MWI5ZTMwZDMtZjBjYi00ODg2LTlmMjYtOGUyZTUyY2NkYWE4@thread.v2/conversations?context=%7B%22contextType%22%3A%22chat%22%7D"
 
@@ -627,6 +631,20 @@ $homeExcelChecksheetCheckBox.AutoSize = $true
 $homeExcelChecksheetCheckBox.Location = New-Object System.Drawing.Point(42, 175)
 $homeTab.Controls.Add($homeExcelChecksheetCheckBox)
 
+$homeGoogleClassroomCheckBox = New-Object System.Windows.Forms.CheckBox
+$homeGoogleClassroomCheckBox.Text = "Google Classroom"
+$homeGoogleClassroomCheckBox.Checked = $false
+$homeGoogleClassroomCheckBox.AutoSize = $true
+$homeGoogleClassroomCheckBox.Location = New-Object System.Drawing.Point(285, 135)
+$homeTab.Controls.Add($homeGoogleClassroomCheckBox)
+
+$homeShadowSocManualCheckBox = New-Object System.Windows.Forms.CheckBox
+$homeShadowSocManualCheckBox.Text = "Shadow SOC Manual"
+$homeShadowSocManualCheckBox.Checked = $false
+$homeShadowSocManualCheckBox.AutoSize = $true
+$homeShadowSocManualCheckBox.Location = New-Object System.Drawing.Point(285, 175)
+$homeTab.Controls.Add($homeShadowSocManualCheckBox)
+
 $homeOpenButton = New-Object System.Windows.Forms.Button
 $homeOpenButton.Text = "Open Selected Websites"
 $homeOpenButton.Size = New-Object System.Drawing.Size(220, 45)
@@ -646,8 +664,16 @@ $homeOpenButton.Add_Click({
         $homeSelectedUrls += $stellarCyberUrl
     }
 
+    if ($homeGoogleClassroomCheckBox.Checked) {
+        $homeSelectedUrls += $googleClassroomUrl
+    }
+
     if ($homeExcelChecksheetCheckBox.Checked) {
         $homeSelectedUrls += $excelChecksheetUrl
+    }
+
+    if ($homeShadowSocManualCheckBox.Checked) {
+        $homeSelectedUrls += $shadowSocManualUrl
     }
 
     if ($homeSelectedUrls.Count -eq 0) {
@@ -698,30 +724,6 @@ $homeMeetingButton.Add_Click({
     Start-Process $teamsAppMeetingUrl
 })
 
-$homeTimeClockButton = New-Object System.Windows.Forms.Button
-$homeTimeClockButton.Text = "Open Teams Time Clock"
-$homeTimeClockButton.Size = New-Object System.Drawing.Size(220, 45)
-$homeTimeClockButton.Location = New-Object System.Drawing.Point(40, 365)
-$homeTimeClockButton.BackColor = [System.Drawing.Color]::FromArgb(45, 125, 95)
-$homeTimeClockButton.ForeColor = [System.Drawing.Color]::White
-$homeTimeClockButton.FlatStyle = "Flat"
-$homeTimeClockButton.FlatAppearance.BorderSize = 0
-$homeTimeClockButton.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
-$homeTimeClockButton.Cursor = [System.Windows.Forms.Cursors]::Hand
-$homeTab.Controls.Add($homeTimeClockButton)
-
-$homeTimeClockButton.Add_Click({
-    try {
-        Start-Process $teamsShiftsUrl
-    }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Microsoft Teams could not be opened. Make sure the Teams desktop application is installed.",
-            "Teams Not Available"
-        )
-    }
-})
-
 $homeClockInButton = New-Object System.Windows.Forms.Button
 $homeClockInButton.Text = "Clock In"
 $homeClockInButton.Size = New-Object System.Drawing.Size(160, 45)
@@ -748,8 +750,8 @@ $homeTab.Controls.Add($homeClockOutButton)
 
 $homeClockStatusLabel = New-Object System.Windows.Forms.Label
 $homeClockStatusLabel.AutoSize = $false
-$homeClockStatusLabel.Size = New-Object System.Drawing.Size(340, 55)
-$homeClockStatusLabel.Location = New-Object System.Drawing.Point(290, 365)
+$homeClockStatusLabel.Size = New-Object System.Drawing.Size(590, 55)
+$homeClockStatusLabel.Location = New-Object System.Drawing.Point(40, 365)
 $homeClockStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
 $homeClockStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $homeTab.Controls.Add($homeClockStatusLabel)
@@ -2133,6 +2135,8 @@ $socToolsTextBoundsControls = @(
     $homeInstructions
     $homeStellarCyberCheckBox
     $homeExcelChecksheetCheckBox
+    $homeGoogleClassroomCheckBox
+    $homeShadowSocManualCheckBox
     $ipLabel
     $ipPrivateLabel
     $ipSiteLabel

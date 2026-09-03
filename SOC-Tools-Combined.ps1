@@ -8,13 +8,15 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
 # Focus Airtable's rich-text JSON editor by its accessibility name, paste the
-# complete JSON, then return to the beginning of Description. If Airtable has
-# not finished loading, retry until the timeout expires. No alert is shown if
-# focus is unavailable; the JSON remains on the clipboard for a normal Ctrl+V.
+# complete JSON, then paste Stellar's alert paragraph at the beginning of
+# Description. The cursor is left on the first blank line after the paragraph.
+# If Airtable has not finished loading, retry until the timeout expires.
 function Set-AirtableJsonField {
     param(
         [Parameter(Mandatory = $true)]
         [string]$JsonText,
+
+        [string]$DescriptionParagraph = "",
 
         [int]$TimeoutSeconds = 20
     )
@@ -77,9 +79,9 @@ function Set-AirtableJsonField {
                                 Start-Sleep -Milliseconds 150
                                 [System.Windows.Forms.SendKeys]::SendWait("^v")
 
-                                # After JSON is pasted, return to Description,
-                                # scroll it into view, and place the cursor at
-                                # the start of its leading blank lines.
+                                # After JSON is pasted, return to Description
+                                # and insert the alert paragraph before the
+                                # existing leading blank lines and template.
                                 Start-Sleep -Milliseconds 250
                                 $airtableDescriptionElements = $airtableSearchRoot.FindAll(
                                     [System.Windows.Automation.TreeScope]::Descendants,
@@ -104,6 +106,28 @@ function Set-AirtableJsonField {
                                             $airtableDescriptionElement.SetFocus()
                                             Start-Sleep -Milliseconds 150
                                             [System.Windows.Forms.SendKeys]::SendWait("^{HOME}")
+
+                                            if (-not [string]::IsNullOrWhiteSpace($DescriptionParagraph)) {
+                                                try {
+                                                    # Paste only the paragraph so no new whitespace
+                                                    # is added to Description.
+                                                    [System.Windows.Forms.Clipboard]::SetText(
+                                                        $DescriptionParagraph.TrimEnd()
+                                                    )
+                                                    Start-Sleep -Milliseconds 100
+                                                    [System.Windows.Forms.SendKeys]::SendWait("^v")
+
+                                                    # Cross two existing newlines so one completely
+                                                    # blank line remains between the paragraph and cursor.
+                                                    Start-Sleep -Milliseconds 75
+                                                    [System.Windows.Forms.SendKeys]::SendWait("{RIGHT 2}")
+                                                }
+                                                catch {
+                                                    # JSON was already pasted. Leave Description
+                                                    # focused even if the paragraph paste fails.
+                                                }
+                                            }
+
                                             return $true
                                         }
                                     }
@@ -216,6 +240,127 @@ function Get-JsonFromText {
     }
 
     return ""
+}
+
+# Stellar uses xdr_event.description for the dynamic paragraph displayed on an
+# alert's Overview tab. Read every unique occurrence from the copied JSON so the
+# paragraph can be added to Airtable without switching browser tabs.
+function Get-StellarAlertDescription {
+    param(
+        [string]$JsonText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($JsonText)) {
+        return ""
+    }
+
+    try {
+        $stellarJsonObject = ConvertFrom-Json -InputObject $JsonText -ErrorAction Stop
+    }
+    catch {
+        return ""
+    }
+
+    $stellarObjectsToInspect = New-Object System.Collections.Queue
+    $stellarObjectsToInspect.Enqueue($stellarJsonObject)
+    $stellarDescriptionValues = New-Object System.Collections.Generic.List[string]
+
+    while ($stellarObjectsToInspect.Count -gt 0) {
+        $stellarCurrentObject = $stellarObjectsToInspect.Dequeue()
+
+        if ($null -eq $stellarCurrentObject -or $stellarCurrentObject -is [string]) {
+            continue
+        }
+
+        # JSON arrays can contain more than one alert record.
+        if (
+            $stellarCurrentObject -is [System.Collections.IEnumerable] -and
+            $stellarCurrentObject -isnot [System.Collections.IDictionary] -and
+            $stellarCurrentObject -isnot [System.Management.Automation.PSCustomObject]
+        ) {
+            foreach ($stellarArrayItem in $stellarCurrentObject) {
+                if ($null -ne $stellarArrayItem) {
+                    $stellarObjectsToInspect.Enqueue($stellarArrayItem)
+                }
+            }
+
+            continue
+        }
+
+        $stellarCurrentProperties = @()
+
+        if ($stellarCurrentObject -is [System.Collections.IDictionary]) {
+            foreach ($stellarDictionaryKey in $stellarCurrentObject.Keys) {
+                $stellarCurrentProperties += [pscustomobject]@{
+                    Name  = [string]$stellarDictionaryKey
+                    Value = $stellarCurrentObject[$stellarDictionaryKey]
+                }
+            }
+        }
+        else {
+            $stellarCurrentProperties = @($stellarCurrentObject.PSObject.Properties)
+        }
+
+        foreach ($stellarCurrentProperty in $stellarCurrentProperties) {
+            $stellarPropertyName = [string]$stellarCurrentProperty.Name
+            $stellarPropertyValue = $stellarCurrentProperty.Value
+
+            # Stellar commonly exports the full field name as one JSON key.
+            if (
+                $stellarPropertyName -ieq "xdr_event.description" -and
+                $stellarPropertyValue -is [string]
+            ) {
+                $stellarDescriptionCandidate = (
+                    $stellarPropertyValue -replace "`r?`n", "`r`n"
+                ).Trim()
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace($stellarDescriptionCandidate) -and
+                    $stellarDescriptionValues -notcontains $stellarDescriptionCandidate
+                ) {
+                    [void]$stellarDescriptionValues.Add($stellarDescriptionCandidate)
+                }
+            }
+
+            # Also support JSON where xdr_event is an object containing description.
+            if ($stellarPropertyName -ieq "xdr_event" -and $null -ne $stellarPropertyValue) {
+                $stellarNestedDescriptionProperty = @(
+                    $stellarPropertyValue.PSObject.Properties |
+                    Where-Object { $_.Name -ieq "description" }
+                ) | Select-Object -First 1
+
+                if (
+                    $null -ne $stellarNestedDescriptionProperty -and
+                    $stellarNestedDescriptionProperty.Value -is [string]
+                ) {
+                    $stellarDescriptionCandidate = (
+                        $stellarNestedDescriptionProperty.Value -replace "`r?`n", "`r`n"
+                    ).Trim()
+
+                    if (
+                        -not [string]::IsNullOrWhiteSpace($stellarDescriptionCandidate) -and
+                        $stellarDescriptionValues -notcontains $stellarDescriptionCandidate
+                    ) {
+                        [void]$stellarDescriptionValues.Add($stellarDescriptionCandidate)
+                    }
+                }
+            }
+
+            if (
+                $null -ne $stellarPropertyValue -and
+                $stellarPropertyValue -isnot [string] -and
+                (
+                    $stellarPropertyValue -is [System.Collections.IDictionary] -or
+                    $stellarPropertyValue -is [System.Management.Automation.PSCustomObject] -or
+                    $stellarPropertyValue -is [System.Collections.IEnumerable]
+                )
+            ) {
+                $stellarObjectsToInspect.Enqueue($stellarPropertyValue)
+            }
+        }
+    }
+
+    return ($stellarDescriptionValues -join "`r`n`r`n")
 }
 
 # Recalculate and then lock the text bounds of controls that were originally
@@ -690,7 +835,7 @@ $homeOpenButton.Add_Click({
 })
 
 $homeMeetingButton = New-Object System.Windows.Forms.Button
-$homeMeetingButton.Text = "Join Teams Meeting"
+$homeMeetingButton.Text = "Join Team Meeting"
 $homeMeetingButton.Size = New-Object System.Drawing.Size(220, 45)
 $homeMeetingButton.Location = New-Object System.Drawing.Point(40, 300)
 $homeMeetingButton.BackColor = [System.Drawing.Color]::FromArgb(88, 80, 190)
@@ -1575,10 +1720,15 @@ $stellarButton.Add_Click({
     $stellarJsonSourceIP = ""
     $stellarJsonDestinationIP = ""
     $stellarJsonHostIP = ""
+    $stellarJsonUser = ""
+    $stellarAlertDescription = ""
 
     # Isolate one valid JSON value without capturing Overview or another object.
     # Keep the JSON's original indentation and line breaks for readability.
     $stellarJsonText = Get-JsonFromText -Text $stellarText
+
+    # Get the same dynamic paragraph Stellar displays on the Overview tab.
+    $stellarAlertDescription = Get-StellarAlertDescription -JsonText $stellarJsonText
 
     # Source IP
     if ($stellarJsonText -match '(?i)"srcip"\s*:\s*"([^"]+)"') {
@@ -1595,6 +1745,15 @@ $stellarButton.Add_Click({
         $stellarJsonHostIP = $matches[1].Trim()
     }
 
+    # User fallback for alerts whose Case Score Breakdown did not load.
+    # Prefer engid_name, then use computer_name when engid_name is unavailable.
+    if ($stellarJsonText -match '(?i)"engid_name"\s*:\s*"([^"]+)"') {
+        $stellarJsonUser = $matches[1].Trim()
+    }
+    elseif ($stellarJsonText -match '(?i)"computer_name"\s*:\s*"([^"]+)"') {
+        $stellarJsonUser = $matches[1].Trim()
+    }
+
     # -----------------------------
     # DETECTION TYPE
     # -----------------------------
@@ -1605,7 +1764,7 @@ $stellarButton.Add_Click({
     if ($stellarText -match '(?i)Sophos') {
         $stellarDetectionType = "EDR Alert"
     }
-    elseif ($stellarText -cmatch 'XDR') {
+    elseif ($stellarText -match 'XDR') {
         $stellarDetectionType = "SIEM Correlation"
     }
 
@@ -1680,6 +1839,41 @@ $stellarButton.Add_Click({
             $stellarIssueMatch.Groups["Issue"].Value -replace '\s+', ' '
         ).Trim()
 
+    }
+
+    # If the visible page did not include Run Analysis, use Stellar's official
+    # JSON display-name field as the Issue. This only runs while Issue is blank.
+    if (-not $stellarIssue -and $stellarJsonText) {
+        try {
+            $stellarIssueJson = ConvertFrom-Json `
+                -InputObject $stellarJsonText `
+                -ErrorAction Stop
+
+            foreach ($stellarIssueJsonRecord in @($stellarIssueJson)) {
+                # Support both a flattened xdr_event.display_name property and
+                # an xdr_event object containing a display_name property.
+                $stellarJsonDisplayName =
+                    $stellarIssueJsonRecord.'xdr_event.display_name'
+
+                if (
+                    [string]::IsNullOrWhiteSpace([string]$stellarJsonDisplayName) -and
+                    $null -ne $stellarIssueJsonRecord.xdr_event
+                ) {
+                    $stellarJsonDisplayName =
+                        $stellarIssueJsonRecord.xdr_event.display_name
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace([string]$stellarJsonDisplayName)) {
+                    $stellarIssue = (
+                        [string]$stellarJsonDisplayName -replace '\s+', ' '
+                    ).Trim()
+                    break
+                }
+            }
+        }
+        catch {
+            # Keep trying the visible Issue-label fallback below.
+        }
     }
 
     # Fallback for Stellar layouts that copy Issue as a separate field label.
@@ -1843,14 +2037,27 @@ $stellarButton.Add_Click({
     # DESCRIPTION / SUPPORTING NOTES TEMPLATE
     # ==========================================
 
-    $stellarNotesTemplate = "Summary:`r`n`r`n" +
-                    "SIP: $stellarSourceHost `r`n" +
-                    "DIP: $stellarDestinationHost `r`n`r`n" +
-                    "$stellarCaseScoreBreakdown`r`n`r`n" +
-                    "Recommendation:`r`n"
+    if ([string]::IsNullOrWhiteSpace($stellarCaseScoreBreakdown)) {
+        # Critical alerts sometimes omit Case Score Breakdown. In that layout,
+        # add the best available JSON user/computer value beneath DIP.
+        $stellarNotesTemplate = "Summary:`r`n`r`n" +
+                        "SIP: $stellarSourceHost `r`n" +
+                        "DIP: $stellarDestinationHost `r`n" +
+                        "User: $stellarJsonUser `r`n`r`n" +
+                        "Recommendation:`r`n"
+    }
+    else {
+        # Preserve the existing template whenever Case Score Breakdown exists.
+        $stellarNotesTemplate = "Summary:`r`n`r`n" +
+                        "SIP: $stellarSourceHost `r`n" +
+                        "DIP: $stellarDestinationHost `r`n`r`n" +
+                        "$stellarCaseScoreBreakdown`r`n`r`n" +
+                        "Recommendation:`r`n"
+    }
 
     $stellarSupportingNotesText = $stellarNotesTemplate
-    # Description matches Supporting Notes, with three blank lines first.
+    # Keep three blank lines at the beginning. After the form opens, the alert
+    # paragraph is pasted into this space without increasing the URL length.
     $stellarDescriptionText = "`r`n`r`n`r`n" + $stellarSupportingNotesText
 
     # -----------------------------
@@ -2038,11 +2245,14 @@ $stellarButton.Add_Click({
 
     Start-Process "chrome.exe" $stellarFinalUrl
 
-    # Copy all JSON, wait for Airtable, focus the named rich-text editor, and
-    # paste it. JSON never becomes part of the URL, so its length cannot crash
-    # the form. If focus times out, the complete JSON remains on the clipboard.
+    # Paste the complete JSON after Airtable loads, then put the alert paragraph
+    # at the top of Description. Neither value increases the URL length.
     if ($stellarJsonText) {
-        [void](Set-AirtableJsonField -JsonText $stellarJsonText -TimeoutSeconds 20)
+        [void](Set-AirtableJsonField `
+            -JsonText $stellarJsonText `
+            -DescriptionParagraph $stellarAlertDescription `
+            -TimeoutSeconds 20
+        )
     }
 
     # Chrome can return focus with stale AutoSize bounds. Refresh and lock the

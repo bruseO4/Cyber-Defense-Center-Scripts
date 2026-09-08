@@ -455,6 +455,18 @@ $trackerSettingsFile = "$PSScriptRoot\SOC-Tracker-Settings.json"
 # Remembers an unfinished clock-in if SOC Tools is closed or restarted.
 $clockStateFile = "$PSScriptRoot\SOC-Clock-State.json"
 
+function Get-TrackerRoleValue {
+    param([string]$Role)
+
+    switch ($Role) {
+        "Shadow" { return "Shadow" }
+        "L1"     { return "L1 Analyst" }
+        "L2"     { return "L2 Analyst" }
+        "L3"     { return "L3 Analyst" }
+        default  { return $null }
+    }
+}
+
 function Get-TrackerWorkbookPath {
     if (Test-Path $trackerSettingsFile) {
         try {
@@ -564,6 +576,17 @@ function Close-TrackerWorkbook {
 }
 
 function Start-SocClock {
+    param([string]$Role)
+
+    $trackerRole = Get-TrackerRoleValue -Role $Role
+    if ([string]::IsNullOrWhiteSpace($trackerRole)) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Select Shadow, L1, L2, or L3 before clocking in.",
+            "Role Needed"
+        )
+        return $null
+    }
+
     if (Test-Path $clockStateFile) {
         try {
             $existingClockState = Get-Content $clockStateFile -Raw | ConvertFrom-Json
@@ -608,12 +631,16 @@ function Start-SocClock {
             throw "No empty Activity Tracker rows were found."
         }
 
-        # H = Week Start, I = Date, J = Start Time, K = End Time, M = Hours
+        # H = Week Start, I = Date, J = Start Time, K = End Time,
+        # M = Hours, N = Role
         $trackerSession.Worksheet.Cells.Item($trackerRow, 8).Value2 = $weekStart.ToOADate()
         $trackerSession.Worksheet.Cells.Item($trackerRow, 9).Value2 = $clockInTime.Date.ToOADate()
         $trackerSession.Worksheet.Cells.Item($trackerRow, 10).Value2 = $clockInTime.TimeOfDay.TotalDays
         [void]$trackerSession.Worksheet.Cells.Item($trackerRow, 11).ClearContents()
         $trackerSession.Worksheet.Cells.Item($trackerRow, 13).Formula = "=ROUND((K$trackerRow-J$trackerRow)*24,2)"
+        # Excel COM can reject a string assigned through Value2 on some systems.
+        # Value accepts the role as text without forcing a numeric cast.
+        $trackerSession.Worksheet.Cells.Item($trackerRow, 14).Value = $trackerRole
 
         Close-TrackerWorkbook -TrackerSession $trackerSession -SaveChanges $true
         $trackerSession = $null
@@ -624,6 +651,8 @@ function Start-SocClock {
             TrackerPath    = $trackerPath
             Worksheet      = "Activity Tracker"
             Row            = $trackerRow
+            Role           = $trackerRole
+            RoleDisplay    = $Role
             ClockIn        = $clockInTime.ToString("o")
             ClockInDisplay = $clockInDisplay
         } |
@@ -633,6 +662,8 @@ function Start-SocClock {
         return [PSCustomObject]@{
             Time    = $clockInTime
             Row     = $trackerRow
+            Role    = $trackerRole
+            RoleDisplay = $Role
             Display = $clockInDisplay
         }
     }
@@ -650,6 +681,8 @@ function Start-SocClock {
 }
 
 function Stop-SocClock {
+    param([string]$SelectedRole)
+
     if (-not (Test-Path $clockStateFile)) {
         [void][System.Windows.Forms.MessageBox]::Show(
             "No active clock-in was found.",
@@ -680,12 +713,30 @@ function Stop-SocClock {
     $clockOutTime = Get-Date
     $trackerSession = $null
 
+    $trackerRole = [string]$clockState.Role
+    $roleDisplay = [string]$clockState.RoleDisplay
+
+    # Supports an unfinished clock-in created by an older script version.
+    if ([string]::IsNullOrWhiteSpace($trackerRole)) {
+        $trackerRole = Get-TrackerRoleValue -Role $SelectedRole
+        $roleDisplay = $SelectedRole
+    }
+
+    if ([string]::IsNullOrWhiteSpace($trackerRole)) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Select Shadow, L1, L2, or L3 before clocking out.",
+            "Role Needed"
+        )
+        return $null
+    }
+
     try {
         $trackerSession = Open-TrackerWorkbookForUpdate -TrackerPath $clockState.TrackerPath
         $trackerRow = [int]$clockState.Row
 
         $trackerSession.Worksheet.Cells.Item($trackerRow, 11).Value2 = $clockOutTime.TimeOfDay.TotalDays
         $trackerSession.Worksheet.Cells.Item($trackerRow, 13).Formula = "=ROUND((K$trackerRow-J$trackerRow)*24,2)"
+        $trackerSession.Worksheet.Cells.Item($trackerRow, 14).Value = $trackerRole
 
         Close-TrackerWorkbook -TrackerSession $trackerSession -SaveChanges $true
         $trackerSession = $null
@@ -695,6 +746,8 @@ function Stop-SocClock {
         return [PSCustomObject]@{
             Time    = $clockOutTime
             Row     = $trackerRow
+            Role    = $trackerRole
+            RoleDisplay = $roleDisplay
             Display = $clockOutTime.ToString("MM/dd/yyyy h:mm:ss tt")
         }
     }
@@ -869,6 +922,25 @@ $homeMeetingButton.Add_Click({
     Start-Process $teamsAppMeetingUrl
 })
 
+$homeRoleLabel = New-Object System.Windows.Forms.Label
+$homeRoleLabel.Text = "Role"
+$homeRoleLabel.AutoSize = $true
+$homeRoleLabel.Location = New-Object System.Drawing.Point(350, 360)
+$homeRoleLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+$homeTab.Controls.Add($homeRoleLabel)
+
+$homeRoleComboBox = New-Object System.Windows.Forms.ComboBox
+$homeRoleComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$homeRoleComboBox.Size = New-Object System.Drawing.Size(120, 30)
+$homeRoleComboBox.Location = New-Object System.Drawing.Point(395, 353)
+$homeRoleComboBox.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+[void]$homeRoleComboBox.Items.Add("Shadow")
+[void]$homeRoleComboBox.Items.Add("L1")
+[void]$homeRoleComboBox.Items.Add("L2")
+[void]$homeRoleComboBox.Items.Add("L3")
+$homeRoleComboBox.SelectedIndex = 1
+$homeTab.Controls.Add($homeRoleComboBox)
+
 $homeClockInButton = New-Object System.Windows.Forms.Button
 $homeClockInButton.Text = "Clock In"
 $homeClockInButton.Size = New-Object System.Drawing.Size(160, 45)
@@ -896,7 +968,7 @@ $homeTab.Controls.Add($homeClockOutButton)
 $homeClockStatusLabel = New-Object System.Windows.Forms.Label
 $homeClockStatusLabel.AutoSize = $false
 $homeClockStatusLabel.Size = New-Object System.Drawing.Size(590, 55)
-$homeClockStatusLabel.Location = New-Object System.Drawing.Point(40, 365)
+$homeClockStatusLabel.Location = New-Object System.Drawing.Point(40, 400)
 $homeClockStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
 $homeClockStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $homeTab.Controls.Add($homeClockStatusLabel)
@@ -905,7 +977,15 @@ if (Test-Path $clockStateFile) {
     try {
         $startupClockState = Get-Content $clockStateFile -Raw | ConvertFrom-Json
         if ($startupClockState.Active) {
-            $homeClockStatusLabel.Text = "Clocked in: $($startupClockState.ClockInDisplay)`nTracker row: $($startupClockState.Row)"
+            if (-not [string]::IsNullOrWhiteSpace([string]$startupClockState.RoleDisplay)) {
+                $homeRoleComboBox.SelectedItem = $startupClockState.RoleDisplay.ToString()
+                $startupRoleText = " | Role: $($startupClockState.RoleDisplay)"
+            }
+            else {
+                $startupRoleText = ""
+            }
+
+            $homeClockStatusLabel.Text = "Clocked in: $($startupClockState.ClockInDisplay)$startupRoleText`nTracker row: $($startupClockState.Row)"
         }
         else {
             $homeClockStatusLabel.Text = "Not currently clocked in"
@@ -920,10 +1000,11 @@ else {
 }
 
 $homeClockInButton.Add_Click({
-    $clockInResult = Start-SocClock
+    $selectedRole = "$($homeRoleComboBox.SelectedItem)"
+    $clockInResult = Start-SocClock -Role $selectedRole
 
     if ($null -ne $clockInResult) {
-        $homeClockStatusLabel.Text = "Clocked in: $($clockInResult.Display)`nTracker row: $($clockInResult.Row)"
+        $homeClockStatusLabel.Text = "Clocked in: $($clockInResult.Display) | Role: $($clockInResult.RoleDisplay)`nTracker row: $($clockInResult.Row)"
 
         try {
             Start-Process $teamsShiftsUrl
@@ -938,10 +1019,11 @@ $homeClockInButton.Add_Click({
 })
 
 $homeClockOutButton.Add_Click({
-    $clockOutResult = Stop-SocClock
+    $selectedRole = "$($homeRoleComboBox.SelectedItem)"
+    $clockOutResult = Stop-SocClock -SelectedRole $selectedRole
 
     if ($null -ne $clockOutResult) {
-        $homeClockStatusLabel.Text = "Clocked out: $($clockOutResult.Display)`nTracker row: $($clockOutResult.Row)"
+        $homeClockStatusLabel.Text = "Clocked out: $($clockOutResult.Display) | Role: $($clockOutResult.RoleDisplay)`nTracker row: $($clockOutResult.Row)"
 
         try {
             Start-Process $teamsShiftsUrl
@@ -1814,8 +1896,10 @@ function Get-IpThreatLocationSummary {
                 $socSignals += "AbuseIPDB identifies this address as a Tor exit node."
             }
 
-            $abuseCountryCode = [string]$abuseData.countryCode
-            $abuseCountryName = Get-IpLookupCountryName -CountryCode $abuseCountryCode
+            # Country code/name are resolved later when the shared location
+            # summary is built; keeping duplicate variables here is unnecessary.
+            # $abuseCountryCode = [string]$abuseData.countryCode
+            # $abuseCountryName = Get-IpLookupCountryName -CountryCode $abuseCountryCode
             $abuseHostnames = @(
                 $abuseData.hostnames |
                     ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 100 } |

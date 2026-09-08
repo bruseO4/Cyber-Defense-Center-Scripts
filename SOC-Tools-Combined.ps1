@@ -976,6 +976,10 @@ $ipHistoryFile = "$PSScriptRoot\IP-Lookup-History.txt"
 # Saves which lookup websites are checked or unchecked
 $ipSettingsFile = "$PSScriptRoot\IP-Lookup-Settings.json"
 
+# Stores optional API keys beside this script. Blank or missing values fall
+# back to Windows environment variables with the same names.
+$ipApiKeysFile = "$PSScriptRoot\IP-Lookup-API-Keys.json"
+
 # Chrome executable location
 $ipChromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 # ------------------------------------------------------------
@@ -1046,6 +1050,928 @@ $ipSites = @(
 $ipSites = $ipSites | Sort-Object Name
 
 # ------------------------------------------------------------
+# THREAT AND LOCATION SUMMARY HELPERS
+# ------------------------------------------------------------
+
+# Optional API keys are read from IP-Lookup-API-Keys.json first, then from
+# Windows environment variables if the matching JSON value is blank or missing:
+#   IPINFO_TOKEN, OTX_API_KEY, VIRUSTOTAL_API_KEY, ABUSEIPDB_API_KEY
+function Get-IpLookupApiKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if (Test-Path -LiteralPath $ipApiKeysFile) {
+        try {
+            $apiKeySettings = Get-Content -LiteralPath $ipApiKeysFile -Raw |
+                ConvertFrom-Json
+            $apiKeyProperty = $apiKeySettings.PSObject.Properties[$Name]
+
+            if (
+                $null -ne $apiKeyProperty -and
+                -not [string]::IsNullOrWhiteSpace([string]$apiKeyProperty.Value)
+            ) {
+                return ([string]$apiKeyProperty.Value).Trim()
+            }
+        }
+        catch {
+            # A missing or invalid JSON file does not stop the lookup. The
+            # environment-variable fallback below is still attempted.
+        }
+    }
+
+    $value = [Environment]::GetEnvironmentVariable(
+        $Name,
+        [EnvironmentVariableTarget]::Process
+    )
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $value = [Environment]::GetEnvironmentVariable(
+            $Name,
+            [EnvironmentVariableTarget]::User
+        )
+    }
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $value = [Environment]::GetEnvironmentVariable(
+            $Name,
+            [EnvironmentVariableTarget]::Machine
+        )
+    }
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $null
+    }
+
+    return $value.Trim()
+}
+
+function Invoke-IpLookupJsonRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [hashtable]$Headers = @{}
+    )
+
+    # Older Windows PowerShell installations may not enable TLS 1.2 by default.
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor
+        [Net.SecurityProtocolType]::Tls12
+
+    return Invoke-RestMethod `
+        -Uri $Uri `
+        -Method Get `
+        -Headers $Headers `
+        -TimeoutSec 6 `
+        -ErrorAction Stop
+}
+
+function Test-IpAddressIsPublic {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Net.IPAddress]$Address
+    )
+
+    if ($Address.IsIPv4MappedToIPv6) {
+        $Address = $Address.MapToIPv4()
+    }
+
+    $bytes = $Address.GetAddressBytes()
+
+    if ($Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        # Private, loopback, link-local, carrier-grade NAT, documentation,
+        # benchmarking, multicast, and reserved IPv4 ranges.
+        if ($bytes[0] -eq 10) { return $false }
+        if ($bytes[0] -eq 127) { return $false }
+        if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $false }
+        if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return $false }
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $false }
+        if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) { return $false }
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 0 -and ($bytes[2] -eq 0 -or $bytes[2] -eq 2)) { return $false }
+        if ($bytes[0] -eq 198 -and ($bytes[1] -eq 18 -or $bytes[1] -eq 19)) { return $false }
+        if ($bytes[0] -eq 198 -and $bytes[1] -eq 51 -and $bytes[2] -eq 100) { return $false }
+        if ($bytes[0] -eq 203 -and $bytes[1] -eq 0 -and $bytes[2] -eq 113) { return $false }
+        if ($bytes[0] -eq 0 -or $bytes[0] -ge 224) { return $false }
+
+        return $true
+    }
+
+    if ($Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        if ($Address.Equals([System.Net.IPAddress]::IPv6Any)) { return $false }
+        if ($Address.Equals([System.Net.IPAddress]::IPv6Loopback)) { return $false }
+        if ($Address.IsIPv6LinkLocal -or $Address.IsIPv6SiteLocal -or $Address.IsIPv6Multicast) { return $false }
+        if (($bytes[0] -band 0xFE) -eq 0xFC) { return $false }
+
+        # 2001:db8::/32 is reserved for documentation.
+        if ($bytes[0] -eq 0x20 -and $bytes[1] -eq 0x01 -and $bytes[2] -eq 0x0D -and $bytes[3] -eq 0xB8) {
+            return $false
+        }
+
+        return $true
+    }
+
+    return $false
+}
+
+function Get-IpLookupCountryName {
+    param([string]$CountryCode)
+
+    if ([string]::IsNullOrWhiteSpace($CountryCode)) {
+        return $null
+    }
+
+    try {
+        return (New-Object System.Globalization.RegionInfo($CountryCode)).EnglishName
+    }
+    catch {
+        return $CountryCode
+    }
+}
+
+function ConvertFrom-IpLookupUnixTime {
+    param($Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+
+    try {
+        $parsedTime = [DateTimeOffset]::FromUnixTimeSeconds([long]$Value)
+        return $parsedTime.UtcDateTime.ToString(
+            "yyyy-MM-dd HH:mm:ss 'UTC'"
+        )
+    }
+    catch {
+        return ([string]$Value).Trim()
+    }
+}
+
+function ConvertTo-IpLookupUtcTime {
+    param($Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+
+    try {
+        $parsedTime = [DateTimeOffset]::Parse([string]$Value)
+        return $parsedTime.UtcDateTime.ToString(
+            "yyyy-MM-dd HH:mm:ss 'UTC'"
+        )
+    }
+    catch {
+        return ([string]$Value).Trim()
+    }
+}
+
+function ConvertTo-IpLookupSingleLine {
+    param(
+        $Value,
+        [int]$MaximumLength = 180
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = (([string]$Value) -replace '\s+', ' ').Trim()
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    if ($MaximumLength -gt 3 -and $text.Length -gt $MaximumLength) {
+        return $text.Substring(0, $MaximumLength - 3) + "..."
+    }
+
+    return $text
+}
+
+function Test-IpLookupValueReported {
+    param(
+        $InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName
+    )
+
+    if ($null -eq $InputObject) {
+        return $false
+    }
+
+    $property = $InputObject.PSObject.Properties[$PropertyName]
+
+    if ($null -eq $property -or $null -eq $property.Value) {
+        return $false
+    }
+
+    if (
+        $property.Value -is [string] -and
+        [string]::IsNullOrWhiteSpace([string]$property.Value)
+    ) {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-IpThreatLocationSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$IpAddress,
+
+        [Parameter(Mandatory = $true)]
+        [System.Net.IPAddress]$ParsedAddress
+    )
+
+    $newLine = [Environment]::NewLine
+
+    if (-not (Test-IpAddressIsPublic -Address $ParsedAddress)) {
+        return @(
+            "IP: $IpAddress"
+            "OVERALL: PRIVATE OR RESERVED ADDRESS"
+            ""
+            "This address is not publicly routable, so it was not sent to external services."
+            "Public geolocation and reputation results do not apply to it."
+        ) -join $newLine
+    }
+
+    $encodedIp = [Uri]::EscapeDataString($IpAddress)
+    $location = $null
+    $network = $null
+    $hostname = $null
+    $providerResponses = 0
+    $threatSourcesChecked = 0
+    $threatSourcesWithAssessment = 0
+    $hasPossibleThreatSignal = $false
+    $hasHighThreatSignal = $false
+    $socSignals = @()
+
+    $ipInfoDetails = @("Status: Request unavailable.")
+    $otxDetails = @("Status: Request unavailable.")
+    $virusTotalDetails = @(
+        "Status: Not checked. Add VIRUSTOTAL_API_KEY to the API key JSON file."
+    )
+    $abuseIpDbDetails = @(
+        "Status: Not checked. Add ABUSEIPDB_API_KEY to the API key JSON file."
+    )
+
+    # IPinfo supplies the primary location and network-owner attribution.
+    try {
+        $ipInfoToken = Get-IpLookupApiKey -Name "IPINFO_TOKEN"
+        $ipInfoUri = "https://ipinfo.io/$encodedIp/json"
+        $ipInfoDataTier = "Legacy/Core"
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoToken)) {
+            $ipInfoUri += "?token=$([Uri]::EscapeDataString($ipInfoToken))"
+        }
+
+        $ipInfo = $null
+
+        try {
+            $ipInfo = Invoke-IpLookupJsonRequest -Uri $ipInfoUri
+        }
+        catch {
+            # New IPinfo accounts use the Lite endpoint. It returns country and
+            # ASN/owner data, while legacy accounts can also return city/region.
+            if (-not [string]::IsNullOrWhiteSpace($ipInfoToken)) {
+                $ipInfoLiteUri = "https://api.ipinfo.io/lite/$encodedIp`?token=$([Uri]::EscapeDataString($ipInfoToken))"
+                $ipInfo = Invoke-IpLookupJsonRequest -Uri $ipInfoLiteUri
+                $ipInfoDataTier = "Lite"
+            }
+            else {
+                throw
+            }
+        }
+
+        $ipInfoCity = [string]$ipInfo.city
+        $ipInfoRegion = [string]$ipInfo.region
+        $ipInfoCountry = [string]$ipInfo.country
+        $ipInfoCountryCode = [string]$ipInfo.country_code
+        $ipInfoAsn = [string]$ipInfo.asn
+        $ipInfoAsName = [string]$ipInfo.as_name
+        $ipInfoAsDomain = [string]$ipInfo.as_domain
+
+        if ($null -ne $ipInfo.geo) {
+            if ([string]::IsNullOrWhiteSpace($ipInfoCity)) { $ipInfoCity = [string]$ipInfo.geo.city }
+            if ([string]::IsNullOrWhiteSpace($ipInfoRegion)) { $ipInfoRegion = [string]$ipInfo.geo.region }
+            if ([string]::IsNullOrWhiteSpace($ipInfoCountry)) { $ipInfoCountry = [string]$ipInfo.geo.country }
+            if ([string]::IsNullOrWhiteSpace($ipInfoCountryCode)) { $ipInfoCountryCode = [string]$ipInfo.geo.country_code }
+        }
+
+        if ($null -ne $ipInfo.as) {
+            if ([string]::IsNullOrWhiteSpace($ipInfoAsn)) { $ipInfoAsn = [string]$ipInfo.as.asn }
+            if ([string]::IsNullOrWhiteSpace($ipInfoAsName)) { $ipInfoAsName = [string]$ipInfo.as.name }
+            if ([string]::IsNullOrWhiteSpace($ipInfoAsDomain)) { $ipInfoAsDomain = [string]$ipInfo.as.domain }
+        }
+
+        # The legacy response stores a two-letter code in country. Newer
+        # responses store the full country name and a separate country_code.
+        if ($ipInfoCountry.Length -eq 2) {
+            if ([string]::IsNullOrWhiteSpace($ipInfoCountryCode)) {
+                $ipInfoCountryCode = $ipInfoCountry
+            }
+
+            $ipInfoCountry = Get-IpLookupCountryName -CountryCode $ipInfoCountry
+        }
+        elseif ([string]::IsNullOrWhiteSpace($ipInfoCountry)) {
+            $ipInfoCountry = Get-IpLookupCountryName -CountryCode $ipInfoCountryCode
+        }
+
+        $locationParts = @(
+            $ipInfoCity
+            $ipInfoRegion
+            $ipInfoCountry
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+
+        if ($locationParts.Count -gt 0) {
+            $location = $locationParts -join ", "
+        }
+
+        $network = [string]$ipInfo.org
+
+        if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace($ipInfoAsName)) {
+            $network = "$ipInfoAsn $ipInfoAsName".Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($ipInfoAsDomain)) {
+                $network += " ($ipInfoAsDomain)"
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($ipInfoAsn) -and $network -match '^(AS\d+)') {
+            $ipInfoAsn = $matches[1]
+        }
+
+        if (
+            [string]::IsNullOrWhiteSpace($ipInfoAsName) -and
+            $network -match '^AS\d+\s+(.+)$'
+        ) {
+            $ipInfoAsName = $matches[1]
+
+            if ($ipInfoAsName -match '^(.+?)\s+\(.+\)$') {
+                $ipInfoAsName = $matches[1]
+            }
+        }
+
+        $hostname = [string]$ipInfo.hostname
+        $providerResponses++
+
+        $ipInfoCountryDisplay = $ipInfoCountry
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoCountryCode)) {
+            if ([string]::IsNullOrWhiteSpace($ipInfoCountryDisplay)) {
+                $ipInfoCountryDisplay = $ipInfoCountryCode
+            }
+            elseif ($ipInfoCountryDisplay -notmatch "\($([regex]::Escape($ipInfoCountryCode))\)$") {
+                $ipInfoCountryDisplay += " ($ipInfoCountryCode)"
+            }
+        }
+
+        $ipInfoCityRegion = @(
+            $ipInfoCity
+            $ipInfoRegion
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+
+        $ipInfoDetails = @("Status: $ipInfoDataTier data received.")
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoCountryDisplay)) {
+            $ipInfoDetails += "Country: $ipInfoCountryDisplay"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoAsn)) {
+            $ipInfoDetails += "ASN: $ipInfoAsn"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoAsName)) {
+            $ipInfoDetails += "Organization: $ipInfoAsName"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoAsDomain)) {
+            $ipInfoDetails += "Organization domain: $ipInfoAsDomain"
+        }
+
+        if ($ipInfoCityRegion.Count -gt 0) {
+            $ipInfoDetails += "City/region: $($ipInfoCityRegion -join ', ')"
+        }
+
+        $ipInfoFlagFields = [ordered]@{
+            "Anycast"                    = "anycast"
+            "Anonymous/VPN/proxy/Tor"    = "is_anonymous"
+            "Hosting/data center"        = "is_hosting"
+            "Mobile carrier"             = "is_mobile"
+            "Bogon/reserved"             = "bogon"
+        }
+
+        foreach ($flagLabel in $ipInfoFlagFields.Keys) {
+            $flagPropertyName = $ipInfoFlagFields[$flagLabel]
+            $flagProperty = $ipInfo.PSObject.Properties[$flagPropertyName]
+
+            if ($null -ne $flagProperty -and $flagProperty.Value -eq $true) {
+                $ipInfoDetails += "$flagLabel`: Yes"
+
+                switch ($flagPropertyName) {
+                    "anycast" {
+                        $socSignals += "IPinfo marks the address as anycast; physical location may vary by requester."
+                    }
+                    "is_anonymous" {
+                        $socSignals += "IPinfo flags anonymous infrastructure such as a VPN, proxy, Tor node, or relay."
+                    }
+                    "is_hosting" {
+                        $socSignals += "IPinfo identifies hosting or data-center infrastructure."
+                    }
+                    "is_mobile" {
+                        $socSignals += "IPinfo identifies a mobile-carrier address; attribution may be shared or temporary."
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $ipInfoDetails = @("Status: Location and attribution request unavailable.")
+    }
+
+    # LevelBlue OTX supplies public threat-intelligence pulse associations.
+    try {
+        $otxHeaders = @{}
+        $otxApiKey = Get-IpLookupApiKey -Name "OTX_API_KEY"
+
+        if (-not [string]::IsNullOrWhiteSpace($otxApiKey)) {
+            $otxHeaders["X-OTX-API-KEY"] = $otxApiKey
+        }
+
+        $otxIndicatorType = "IPv4"
+        if ($ParsedAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            $otxIndicatorType = "IPv6"
+        }
+
+        $otxUri = "https://otx.alienvault.com/api/v1/indicators/$otxIndicatorType/$encodedIp/general"
+        $otx = Invoke-IpLookupJsonRequest -Uri $otxUri -Headers $otxHeaders
+        $otxPulseCount = $null
+        $otxHasPulseCount = $false
+        $otxHasAssessment = $false
+
+        if (Test-IpLookupValueReported -InputObject $otx.pulse_info -PropertyName "count") {
+            $otxPulseCount = [int]$otx.pulse_info.count
+            $otxHasPulseCount = $true
+            $otxHasAssessment = $true
+        }
+
+        $threatSourcesChecked++
+        $providerResponses++
+
+        if ($otxHasPulseCount -and $otxPulseCount -gt 0) {
+            $hasPossibleThreatSignal = $true
+            $socSignals += "OTX links this IP to $otxPulseCount threat-intelligence pulse(s)."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($location) -and -not [string]::IsNullOrWhiteSpace([string]$otx.country_name)) {
+            $location = [string]$otx.country_name
+        }
+
+        if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace([string]$otx.asn)) {
+            $network = [string]$otx.asn
+        }
+
+        $otxPulses = @($otx.pulse_info.pulses)
+        $otxPulseNames = @(
+            $otxPulses |
+                ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_.name -MaximumLength 120 } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 5
+        )
+        $otxPulseTags = @(
+            $otxPulses |
+                ForEach-Object { $_.tags } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                Sort-Object -Unique |
+                Select-Object -First 12
+        )
+        $otxAdversaries = @(
+            $otxPulses |
+                ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_.adversary -MaximumLength 80 } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 8
+        )
+        $otxIndustries = @(
+            $otxPulses |
+                ForEach-Object { $_.industries } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                Sort-Object -Unique |
+                Select-Object -First 8
+        )
+        $otxTargetedCountries = @(
+            $otxPulses |
+                ForEach-Object { $_.targeted_countries } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                Sort-Object -Unique |
+                Select-Object -First 8
+        )
+        $otxReputation = ConvertTo-IpLookupSingleLine -Value $otx.reputation -MaximumLength 80
+
+        if (-not [string]::IsNullOrWhiteSpace($otxReputation)) {
+            $otxHasAssessment = $true
+        }
+
+        if ($otxHasAssessment) {
+            $threatSourcesWithAssessment++
+        }
+
+        $otxDetails = @("Status: Threat-intelligence data received.")
+
+        if ($otxHasPulseCount) {
+            $otxDetails += "Related pulses: $otxPulseCount"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($otxReputation)) {
+            $otxDetails += "Reputation: $otxReputation"
+        }
+
+        if ($otxPulseNames.Count -gt 0) {
+            $otxDetails += "Pulse names (up to 5): $($otxPulseNames -join ' | ')"
+        }
+
+        if ($otxPulseTags.Count -gt 0) {
+            $otxDetails += "Tags (up to 12): $($otxPulseTags -join ', ')"
+        }
+
+        if ($otxAdversaries.Count -gt 0) {
+            $otxDetails += "Adversaries: $($otxAdversaries -join ', ')"
+        }
+
+        if ($otxIndustries.Count -gt 0) {
+            $otxDetails += "Industries: $($otxIndustries -join ', ')"
+        }
+
+        if ($otxTargetedCountries.Count -gt 0) {
+            $otxDetails += "Targeted countries: $($otxTargetedCountries -join ', ')"
+        }
+    }
+    catch {
+        $otxDetails = @("Status: Threat-intelligence request unavailable.")
+    }
+
+    # VirusTotal is queried only when the user has configured an API key.
+    $virusTotalApiKey = Get-IpLookupApiKey -Name "VIRUSTOTAL_API_KEY"
+    if (-not [string]::IsNullOrWhiteSpace($virusTotalApiKey)) {
+        try {
+            $virusTotalHeaders = @{ "x-apikey" = $virusTotalApiKey }
+            $virusTotalUri = "https://www.virustotal.com/api/v3/ip_addresses/$encodedIp"
+            $virusTotal = Invoke-IpLookupJsonRequest -Uri $virusTotalUri -Headers $virusTotalHeaders
+            $virusTotalAttributes = $virusTotal.data.attributes
+            $virusTotalStats = $virusTotalAttributes.last_analysis_stats
+            $virusTotalHasMalicious = Test-IpLookupValueReported -InputObject $virusTotalStats -PropertyName "malicious"
+            $virusTotalHasSuspicious = Test-IpLookupValueReported -InputObject $virusTotalStats -PropertyName "suspicious"
+            $virusTotalHasReputation = Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "reputation"
+            $virusTotalMalicious = $null
+            $virusTotalSuspicious = $null
+            $virusTotalReputation = $null
+
+            if ($virusTotalHasMalicious) { $virusTotalMalicious = [int]$virusTotalStats.malicious }
+            if ($virusTotalHasSuspicious) { $virusTotalSuspicious = [int]$virusTotalStats.suspicious }
+            if ($virusTotalHasReputation) { $virusTotalReputation = [int]$virusTotalAttributes.reputation }
+
+            $threatSourcesChecked++
+            $providerResponses++
+
+            if ($virusTotalHasMalicious -or $virusTotalHasSuspicious -or $virusTotalHasReputation) {
+                $threatSourcesWithAssessment++
+            }
+
+            if ($virusTotalHasMalicious -and $virusTotalMalicious -ge 5) {
+                $hasHighThreatSignal = $true
+            }
+            elseif (
+                ($virusTotalHasMalicious -and $virusTotalMalicious -gt 0) -or
+                ($virusTotalHasSuspicious -and $virusTotalSuspicious -gt 0)
+            ) {
+                $hasPossibleThreatSignal = $true
+            }
+
+            if ($virusTotalHasReputation -and $virusTotalReputation -lt 0) {
+                $hasPossibleThreatSignal = $true
+                $socSignals += "VirusTotal community reputation is negative ($virusTotalReputation)."
+            }
+
+            $virusTotalPositiveVerdicts = @()
+
+            if ($virusTotalHasMalicious -and $virusTotalMalicious -gt 0) {
+                $virusTotalPositiveVerdicts += "$virusTotalMalicious malicious"
+            }
+
+            if ($virusTotalHasSuspicious -and $virusTotalSuspicious -gt 0) {
+                $virusTotalPositiveVerdicts += "$virusTotalSuspicious suspicious"
+            }
+
+            if ($virusTotalPositiveVerdicts.Count -gt 0) {
+                $socSignals += "VirusTotal reports $($virusTotalPositiveVerdicts -join ' and ') engine result(s)."
+            }
+
+            $virusTotalFlaggingEngines = @()
+
+            if (Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "last_analysis_results") {
+                $virusTotalFlaggingEngines = @(
+                    foreach ($engineProperty in $virusTotalAttributes.last_analysis_results.PSObject.Properties) {
+                        $engineCategory = [string]$engineProperty.Value.category
+
+                        if ($engineCategory -eq "malicious" -or $engineCategory -eq "suspicious") {
+                            ConvertTo-IpLookupSingleLine `
+                                -Value $engineProperty.Value.engine_name `
+                                -MaximumLength 60
+                        }
+                    }
+                ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Sort-Object -Unique |
+                    Select-Object -First 12
+            }
+
+            $virusTotalTags = @()
+
+            if (Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "tags") {
+                $virusTotalTags = @(
+                    $virusTotalAttributes.tags |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                    Sort-Object -Unique |
+                    Select-Object -First 12
+                )
+            }
+
+            $virusTotalLastAnalysis = $null
+
+            if (Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "last_analysis_date") {
+                $virusTotalLastAnalysis = ConvertFrom-IpLookupUnixTime `
+                    -Value $virusTotalAttributes.last_analysis_date
+            }
+
+            $virusTotalDetails = @("Status: Reputation data received.")
+            $virusTotalVerdictParts = @()
+
+            if ($virusTotalHasMalicious) { $virusTotalVerdictParts += "Malicious=$virusTotalMalicious" }
+            if ($virusTotalHasSuspicious) { $virusTotalVerdictParts += "Suspicious=$virusTotalSuspicious" }
+
+            if ($virusTotalVerdictParts.Count -gt 0) {
+                $virusTotalDetails += "Engine verdicts: $($virusTotalVerdictParts -join '; ')"
+            }
+
+            if ($virusTotalHasReputation) {
+                $virusTotalDetails += "Community reputation: $virusTotalReputation (negative is suspicious; positive is favorable)"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($virusTotalLastAnalysis)) {
+                $virusTotalDetails += "Last analysis: $virusTotalLastAnalysis"
+            }
+
+            if ($virusTotalFlaggingEngines.Count -gt 0) {
+                $virusTotalDetails += "Flagging engines (up to 12): $($virusTotalFlaggingEngines -join ', ')"
+            }
+
+            if ($virusTotalTags.Count -gt 0) {
+                $virusTotalDetails += "Tags (up to 12): $($virusTotalTags -join ', ')"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.as_owner)) {
+                $network = [string]$virusTotalAttributes.as_owner
+
+                if (
+                    (Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "asn") -and
+                    [int]$virusTotalAttributes.asn -gt 0
+                ) {
+                    $network = "AS$($virusTotalAttributes.asn) $network"
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($location) -and -not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.country)) {
+                $location = Get-IpLookupCountryName -CountryCode ([string]$virusTotalAttributes.country)
+            }
+        }
+        catch {
+            $virusTotalDetails = @(
+                "Status: Request unavailable; check VIRUSTOTAL_API_KEY or its quota."
+            )
+        }
+    }
+
+    # AbuseIPDB is queried only when the user has configured an API key.
+    $abuseIpDbApiKey = Get-IpLookupApiKey -Name "ABUSEIPDB_API_KEY"
+    if (-not [string]::IsNullOrWhiteSpace($abuseIpDbApiKey)) {
+        try {
+            $abuseIpDbHeaders = @{
+                "Key"    = $abuseIpDbApiKey
+                "Accept" = "application/json"
+            }
+            # The standard CHECK response already includes the SOC fields used
+            # below. Omitting verbose avoids downloading thousands of raw reports.
+            $abuseIpDbUri = "https://api.abuseipdb.com/api/v2/check?ipAddress=$encodedIp&maxAgeInDays=90"
+            $abuseIpDb = Invoke-IpLookupJsonRequest -Uri $abuseIpDbUri -Headers $abuseIpDbHeaders
+            $abuseData = $abuseIpDb.data
+            $abuseHasScore = Test-IpLookupValueReported -InputObject $abuseData -PropertyName "abuseConfidenceScore"
+            $abuseHasReports = Test-IpLookupValueReported -InputObject $abuseData -PropertyName "totalReports"
+            $abuseHasDistinctUsers = Test-IpLookupValueReported -InputObject $abuseData -PropertyName "numDistinctUsers"
+            $abuseScore = $null
+            $abuseReports = $null
+            $abuseDistinctUsers = $null
+
+            if ($abuseHasScore) { $abuseScore = [int]$abuseData.abuseConfidenceScore }
+            if ($abuseHasReports) { $abuseReports = [int]$abuseData.totalReports }
+            if ($abuseHasDistinctUsers) { $abuseDistinctUsers = [int]$abuseData.numDistinctUsers }
+
+            $threatSourcesChecked++
+            $providerResponses++
+
+            if ($abuseHasScore -or $abuseHasReports) {
+                $threatSourcesWithAssessment++
+            }
+
+            if ($abuseHasScore -and $abuseScore -ge 75) {
+                $hasHighThreatSignal = $true
+            }
+            elseif (
+                ($abuseHasScore -and $abuseScore -ge 25) -or
+                ($abuseHasReports -and $abuseReports -gt 0)
+            ) {
+                $hasPossibleThreatSignal = $true
+            }
+
+            if (
+                ($abuseHasReports -and $abuseReports -gt 0) -or
+                ($abuseHasScore -and $abuseScore -gt 0)
+            ) {
+                $abuseSignalParts = @()
+
+                if ($abuseHasScore) { $abuseSignalParts += "$abuseScore% confidence" }
+                if ($abuseHasReports) { $abuseSignalParts += "$abuseReports report(s) in 90 days" }
+                if ($abuseHasDistinctUsers) { $abuseSignalParts += "$abuseDistinctUsers distinct reporter(s)" }
+
+                $socSignals += "AbuseIPDB reports $($abuseSignalParts -join ', ')."
+            }
+
+            if (
+                (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isTor") -and
+                $abuseData.isTor -eq $true
+            ) {
+                $socSignals += "AbuseIPDB identifies this address as a Tor exit node."
+            }
+
+            $abuseCountryCode = [string]$abuseData.countryCode
+            $abuseCountryName = Get-IpLookupCountryName -CountryCode $abuseCountryCode
+            $abuseHostnames = @(
+                $abuseData.hostnames |
+                    ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 100 } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Sort-Object -Unique |
+                    Select-Object -First 3
+            )
+            $abuseLastReported = $null
+
+            if (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "lastReportedAt") {
+                $abuseLastReported = ConvertTo-IpLookupUtcTime -Value $abuseData.lastReportedAt
+            }
+
+            $abuseIpDbDetails = @("Status: Abuse-report data received.")
+
+            if ($abuseHasScore) {
+                $abuseIpDbDetails += "Abuse confidence: $abuseScore%"
+            }
+
+            if ($abuseHasReports) {
+                $abuseIpDbDetails += "Reports in last 90 days: $abuseReports"
+            }
+
+            if ($abuseHasDistinctUsers) {
+                $abuseIpDbDetails += "Distinct reporters: $abuseDistinctUsers"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($abuseLastReported)) {
+                $abuseIpDbDetails += "Last reported: $abuseLastReported"
+            }
+
+            if (
+                (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isTor") -and
+                $abuseData.isTor -eq $true
+            ) {
+                $abuseIpDbDetails += "Tor exit node: Yes"
+            }
+
+            if (
+                (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isWhitelisted") -and
+                $abuseData.isWhitelisted -eq $true
+            ) {
+                $abuseIpDbDetails += "Whitelisted by AbuseIPDB: Yes"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.usageType)) {
+                $abuseIpDbDetails += "Usage type: $($abuseData.usageType)"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.isp)) {
+                $abuseIpDbDetails += "ISP: $($abuseData.isp)"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.domain)) {
+                $abuseIpDbDetails += "Domain: $($abuseData.domain)"
+            }
+
+            if ($abuseHostnames.Count -gt 0) {
+                $abuseIpDbDetails += "Hostnames (up to 3): $($abuseHostnames -join ', ')"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace([string]$abuseData.isp)) {
+                $network = [string]$abuseData.isp
+
+                if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.domain)) {
+                    $network += " ($($abuseData.domain))"
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($location) -and -not [string]::IsNullOrWhiteSpace([string]$abuseData.countryCode)) {
+                $location = Get-IpLookupCountryName -CountryCode ([string]$abuseData.countryCode)
+            }
+        }
+        catch {
+            $abuseIpDbDetails = @(
+                "Status: Request unavailable; check ABUSEIPDB_API_KEY or its quota."
+            )
+        }
+    }
+
+    if ($hasHighThreatSignal) {
+        $overall = "HIGH-RISK SIGNALS"
+    }
+    elseif ($hasPossibleThreatSignal) {
+        $overall = "POSSIBLE THREAT SIGNALS"
+    }
+    elseif ($threatSourcesWithAssessment -gt 0) {
+        $overall = "NO THREAT FLAGS FOUND"
+    }
+    else {
+        $overall = "LIMITED THREAT DATA"
+    }
+
+    if ($socSignals.Count -eq 0) {
+        if ($threatSourcesWithAssessment -gt 0) {
+            $socSignals = @("No positive threat signals were returned by the responding threat feeds.")
+        }
+        elseif ($threatSourcesChecked -gt 0) {
+            $socSignals = @("Threat feeds responded but did not return a usable threat assessment.")
+        }
+        else {
+            $socSignals = @("No threat feed responded; review the provider status lines below.")
+        }
+    }
+
+    $summaryLines = @(
+        "IP: $IpAddress"
+        "OVERALL: $overall"
+        "Providers responding: $providerResponses of 4"
+        "Threat feeds checked: $threatSourcesChecked of 3"
+        ""
+        "QUICK SOC FLAGS / CONTEXT"
+        $socSignals
+    )
+
+    $combinedAttributionDetails = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($location)) {
+        $combinedAttributionDetails += "Location: $location"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($network)) {
+        $combinedAttributionDetails += "Network/owner: $network"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($hostname)) {
+        $combinedAttributionDetails += "Hostname: $hostname"
+    }
+
+    if ($combinedAttributionDetails.Count -gt 0) {
+        $summaryLines += ""
+        $summaryLines += "COMBINED ATTRIBUTION"
+        $summaryLines += $combinedAttributionDetails
+    }
+
+    $summaryLines += @(
+        ""
+        "1. IPINFO"
+        $ipInfoDetails
+        ""
+        "2. LEVELBLUE OTX"
+        $otxDetails
+        ""
+        "3. VIRUSTOTAL"
+        $virusTotalDetails
+        ""
+        "4. ABUSEIPDB"
+        $abuseIpDbDetails
+        ""
+        "Analyst note: Reputation is point-in-time context. Corroborate it with the alert, logs, asset role, direction of traffic, and observed behavior."
+    )
+
+    return $summaryLines -join $newLine
+}
+
+# ------------------------------------------------------------
 # IP ADDRESS LABEL
 # ------------------------------------------------------------
 
@@ -1111,6 +2037,13 @@ $ipButton.Size = New-Object System.Drawing.Size(100,30)
 # Sets the button position
 $ipButton.Location = New-Object System.Drawing.Point(285,48)
 
+# Creates a second button that builds the same automatic summary without
+# opening any browser tabs.
+$ipSummaryOnlyButton = New-Object System.Windows.Forms.Button
+$ipSummaryOnlyButton.Text = "Summary Only"
+$ipSummaryOnlyButton.Size = New-Object System.Drawing.Size(100,30)
+$ipSummaryOnlyButton.Location = New-Object System.Drawing.Point(285,82)
+
 
 # ------------------------------------------------------------
 # ENTER KEY = RUN LOOKUP
@@ -1159,13 +2092,53 @@ $ipSiteChecklist.Add_MouseUp({
     $ipSiteChecklist.ClearSelected()
 })
 
+# ------------------------------------------------------------
+# THREAT AND LOCATION SUMMARY PANEL
+# ------------------------------------------------------------
+
+$ipSummaryLabel = New-Object System.Windows.Forms.Label
+$ipSummaryLabel.Text = "Threat & Location Summary:"
+$ipSummaryLabel.UseMnemonic = $false
+$ipSummaryLabel.AutoSize = $true
+$ipSummaryLabel.Location = New-Object System.Drawing.Point(400,25)
+
+$ipCopySummaryButton = New-Object System.Windows.Forms.Button
+$ipCopySummaryButton.Text = "Copy Summary"
+$ipCopySummaryButton.Size = New-Object System.Drawing.Size(100,28)
+$ipCopySummaryButton.Location = New-Object System.Drawing.Point(590,18)
+$ipCopySummaryButton.Enabled = $false
+
+$ipSummaryBox = New-Object System.Windows.Forms.RichTextBox
+$ipSummaryBox.Location = New-Object System.Drawing.Point(400,50)
+$ipSummaryBox.Size = New-Object System.Drawing.Size(290,460)
+$ipSummaryBox.ReadOnly = $true
+$ipSummaryBox.WordWrap = $true
+$ipSummaryBox.ScrollBars = "Vertical"
+$ipSummaryBox.DetectUrls = $false
+$ipSummaryBox.Text = "Run a lookup to see where the IP is from and whether threat-intelligence sources report it."
+$ipSummaryBox.Anchor = "Top, Bottom, Left, Right"
+
+$ipCopySummaryButton.Add_Click({
+    if (-not [string]::IsNullOrWhiteSpace($ipSummaryBox.Text)) {
+        [System.Windows.Forms.Clipboard]::SetText($ipSummaryBox.Text)
+    }
+})
+
 # Chrome cleanup instructions shown directly below the website checklist
 $ipCloseTabsTip = New-Object System.Windows.Forms.Label
-$ipCloseTabsTip.Text = 'Chrome tip: To close all lookup tabs, right-click the tab you want to keep, then choose "Close tabs to the right."'
+$ipCloseTabsTip.Text = 'Chrome tip: To close all lookup tabs, right-click the tab' + "`n" + 'you want to keep, then choose "Close tabs to the right."'
 $ipCloseTabsTip.AutoSize = $false
-$ipCloseTabsTip.Size = New-Object System.Drawing.Size(650,40)
-$ipCloseTabsTip.Location = New-Object System.Drawing.Point(20,520)
+$ipCloseTabsTip.Size = New-Object System.Drawing.Size(455,36)
+$ipCloseTabsTip.Location = New-Object System.Drawing.Point(20,514)
 $ipCloseTabsTip.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
+
+# Explains which services contribute to the automatic summary
+$ipSummarySourcesTip = New-Object System.Windows.Forms.Label
+$ipSummarySourcesTip.Text = "The four websites that work with the summary are:`n1. IPinfo`n2. LevelBlue OTX`n3. VirusTotal`n4. AbuseIPDB"
+$ipSummarySourcesTip.AutoSize = $false
+$ipSummarySourcesTip.Size = New-Object System.Drawing.Size(455,82)
+$ipSummarySourcesTip.Location = New-Object System.Drawing.Point(20,552)
+$ipSummarySourcesTip.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
 
 
 # ------------------------------------------------------------
@@ -1326,6 +2299,16 @@ $ipButton.FlatAppearance.MouseOverBackColor = `
 $ipButton.FlatAppearance.MouseDownBackColor = `
     [System.Drawing.Color]::FromArgb(0,80,160)
 
+# Summary-only button styling
+$ipSummaryOnlyButton.FlatStyle = "Flat"
+$ipSummaryOnlyButton.BackColor = [System.Drawing.Color]::FromArgb(40,145,120)
+$ipSummaryOnlyButton.ForeColor = [System.Drawing.Color]::White
+$ipSummaryOnlyButton.FlatAppearance.BorderSize = 0
+$ipSummaryOnlyButton.FlatAppearance.MouseOverBackColor = `
+    [System.Drawing.Color]::FromArgb(30,125,100)
+$ipSummaryOnlyButton.FlatAppearance.MouseDownBackColor = `
+    [System.Drawing.Color]::FromArgb(20,105,85)
+
 
 
 # ------------------------------------------------------------
@@ -1337,6 +2320,18 @@ $ipPrivateLabel.ForeColor = [System.Drawing.Color]::FromArgb(190,90,35)
 
 # Makes the Chrome tab-cleanup instruction readable without overpowering the form
 $ipCloseTabsTip.ForeColor = [System.Drawing.Color]::FromArgb(75,85,95)
+$ipSummarySourcesTip.ForeColor = [System.Drawing.Color]::FromArgb(75,85,95)
+
+# Threat/location results styling
+$ipSummaryLabel.ForeColor = [System.Drawing.Color]::FromArgb(35,95,160)
+$ipSummaryBox.BackColor = [System.Drawing.Color]::White
+$ipSummaryBox.ForeColor = [System.Drawing.Color]::FromArgb(35,35,35)
+$ipSummaryBox.BorderStyle = "FixedSingle"
+$ipSummaryBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$ipCopySummaryButton.FlatStyle = "Flat"
+$ipCopySummaryButton.BackColor = [System.Drawing.Color]::FromArgb(90,105,120)
+$ipCopySummaryButton.ForeColor = [System.Drawing.Color]::White
+$ipCopySummaryButton.FlatAppearance.BorderSize = 0
 
 # ------------------------------------------------------------
 # LOOKUP WEBSITE SECTION
@@ -1366,9 +2361,12 @@ $ipHistoryBox.BorderStyle = "FixedSingle"
 # RUN LOOKUP ACTION
 # ------------------------------------------------------------
 
-# Everything inside this block happens when Run Lookup is clicked
-# or when Enter is pressed
-$ipButton.Add_Click({
+# Both buttons use the same lookup routine. Run Lookup opens the checked
+# websites and builds the summary; Summary Only skips the browser tabs.
+$ipRunLookupAction = {
+    param(
+        [bool]$OpenWebsites
+    )
 
     # Gets the IP address from the search box
     # Gets whatever the user entered
@@ -1449,35 +2447,69 @@ $ipTextBox.Text = $ipIp
     # Writes the newest entry first, followed by all older entries
     @($ipHistoryEntry) + $ipExistingHistory | Set-Content $ipHistoryFile
 
-    # --------------------------------------------------------
-    # OPEN SELECTED LOOKUP WEBSITES IN CHROME
-    # --------------------------------------------------------
+    if ($OpenWebsites) {
+        # --------------------------------------------------------
+        # OPEN SELECTED LOOKUP WEBSITES IN CHROME
+        # --------------------------------------------------------
 
-    # Holds all selected lookup URLs
-    $ipSelectedUrls = @()
+        # Holds all selected lookup URLs
+        $ipSelectedUrls = @()
 
-    # Go through every website
-    foreach ($ipSite in $ipSites) {
+        # Go through every website
+        foreach ($ipSite in $ipSites) {
 
-        # Only use websites that are checked
-        if ($ipSiteChecklist.CheckedItems -contains $ipSite.Name) {
+            # Only use websites that are checked
+            if ($ipSiteChecklist.CheckedItems -contains $ipSite.Name) {
 
-            # Insert the IP address into the site's URL
-            $ipUrl = [string]::Format($ipSite.Url, $ipIp)
+                # Insert the IP address into the site's URL
+                $ipUrl = [string]::Format($ipSite.Url, $ipIp)
 
-            # Add the finished URL to the list
-            $ipSelectedUrls += $ipUrl
+                # Add the finished URL to the list
+                $ipSelectedUrls += $ipUrl
+            }
+        }
+
+        # Only continue if at least one website is selected
+        if ($ipSelectedUrls.Count -gt 0) {
+
+            # Send all selected URLs to Chrome
+            # If Chrome is already open, these should open as new tabs
+            Start-Process `
+                -FilePath $ipChromePath `
+                -ArgumentList $ipSelectedUrls
         }
     }
 
-    # Only continue if at least one website is selected
-    if ($ipSelectedUrls.Count -gt 0) {
+    # --------------------------------------------------------
+    # BUILD THREAT AND LOCATION SUMMARY
+    # --------------------------------------------------------
 
-        # Send all selected URLs to Chrome
-        # If Chrome is already open, these should open as new tabs
-        Start-Process `
-            -FilePath $ipChromePath `
-            -ArgumentList $ipSelectedUrls
+    # During a full lookup, browser tabs open before slow API responses run.
+    $ipButton.Enabled = $false
+    $ipSummaryOnlyButton.Enabled = $false
+    $ipCopySummaryButton.Enabled = $false
+    $ipSummaryBox.Text = "Checking public location and threat-intelligence sources..."
+    $mainForm.UseWaitCursor = $true
+    [System.Windows.Forms.Application]::DoEvents()
+
+    try {
+        $ipSummaryBox.Text = Get-IpThreatLocationSummary `
+            -IpAddress $ipIp `
+            -ParsedAddress $ipValidIP
+        $ipSummaryBox.SelectionStart = 0
+        $ipSummaryBox.ScrollToCaret()
+        $ipCopySummaryButton.Enabled = $true
+    }
+    catch {
+        $ipSummaryBox.Text = (
+            "IP: $ipIp`r`nOVERALL: SUMMARY UNAVAILABLE`r`n`r`n" +
+            "The lookup websites can still be reviewed in Chrome."
+        )
+    }
+    finally {
+        $mainForm.UseWaitCursor = $false
+        $ipButton.Enabled = $true
+        $ipSummaryOnlyButton.Enabled = $true
     }
     
 
@@ -1491,6 +2523,16 @@ $ipTextBox.Text = $ipIp
 
     # Places the cursor back in the search box
     $ipTextBox.Focus()
+}
+
+# The normal button and Enter key perform the complete lookup.
+$ipButton.Add_Click({
+    & $ipRunLookupAction -OpenWebsites $true
+})
+
+# This button only refreshes the automatic summary panel.
+$ipSummaryOnlyButton.Add_Click({
+    & $ipRunLookupAction -OpenWebsites $false
 })
 
 
@@ -1507,6 +2549,9 @@ $ipTab.Controls.Add($ipTextBox)
 # Adds the Run Lookup button
 $ipTab.Controls.Add($ipButton)
 
+# Adds the Summary Only button
+$ipTab.Controls.Add($ipSummaryOnlyButton)
+
 # Adds the Lookup History label
 $ipTab.Controls.Add($ipHistoryLabel)
 
@@ -1522,8 +2567,16 @@ $ipTab.Controls.Add($ipSiteLabel)
 # Adds the website checklist
 $ipTab.Controls.Add($ipSiteChecklist)
 
+# Adds the threat/location summary panel
+$ipTab.Controls.Add($ipSummaryLabel)
+$ipTab.Controls.Add($ipSummaryBox)
+$ipTab.Controls.Add($ipCopySummaryButton)
+
 # Adds the Chrome tab cleanup instructions
 $ipTab.Controls.Add($ipCloseTabsTip)
+
+# Adds the automatic-summary source explanation
+$ipTab.Controls.Add($ipSummarySourcesTip)
 
 
 # ------------------------------------------------------------
@@ -2351,6 +3404,7 @@ $socToolsTextBoundsControls = @(
     $ipPrivateLabel
     $ipSiteLabel
     $ipHistoryLabel
+    $ipSummaryLabel
 )
 
 # Refresh the affected text bounds whenever SOC Tools regains focus after

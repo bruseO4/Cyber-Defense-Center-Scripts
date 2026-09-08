@@ -4,14 +4,15 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 
+# This function runs ONLY in the separate PowerShell worker below. Loading or
+# using UI Automation in the GUI process can initialize WPF's DPI awareness
+# after the form is already visible, changing its scale and checkbox rendering.
 # Focus Airtable's rich-text JSON editor by its accessibility name, paste the
 # complete JSON, then paste Stellar's alert paragraph at the beginning of
 # Description. The cursor is left on the first blank line after the paragraph.
 # If Airtable has not finished loading, retry until the timeout expires.
-function Set-AirtableJsonField {
+function Invoke-AirtableJsonFieldWorker {
     param(
         [Parameter(Mandatory = $true)]
         [string]$JsonText,
@@ -24,6 +25,10 @@ function Set-AirtableJsonField {
     if ([string]::IsNullOrWhiteSpace($JsonText)) {
         return $false
     }
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
 
     try {
         [System.Windows.Forms.Clipboard]::SetText($JsonText)
@@ -154,6 +159,119 @@ function Set-AirtableJsonField {
     }
 
     return $false
+}
+
+# Keep UI Automation and its DPI changes outside the process that owns the
+# SOC Tools window. A separate runspace/thread would still share process DPI.
+# Send the existing worker and its inputs through standard input, so long JSON
+# and Unicode do not become command-line arguments or temporary files.
+function Set-AirtableJsonField {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$JsonText,
+
+        [string]$DescriptionParagraph = "",
+
+        [ValidateRange(1, 300)]
+        [int]$TimeoutSeconds = 20
+    )
+
+    if ([string]::IsNullOrWhiteSpace($JsonText)) {
+        return $false
+    }
+
+    $airtableWorkerProcess = $null
+    $airtableWorkerStarted = $false
+
+    try {
+        # Preserve the existing clipboard fallback if automatic pasting fails.
+        [System.Windows.Forms.Clipboard]::SetText($JsonText)
+
+        $airtableWorkerRequest = @{
+            WorkerScript = ${function:Invoke-AirtableJsonFieldWorker}.ToString()
+            JsonText = $JsonText
+            DescriptionParagraph = $DescriptionParagraph
+            TimeoutSeconds = $TimeoutSeconds
+        }
+        $airtableRequestXml = [System.Management.Automation.PSSerializer]::Serialize(
+            $airtableWorkerRequest
+        )
+        $airtableRequestBase64 = [Convert]::ToBase64String(
+            [System.Text.Encoding]::Unicode.GetBytes($airtableRequestXml)
+        )
+
+        # Only this fixed bootstrap is on the command line. The alert is data,
+        # never interpolated into executable PowerShell source.
+        $airtableWorkerBootstrap = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $requestXml = [System.Text.Encoding]::Unicode.GetString(
+        [Convert]::FromBase64String([Console]::In.ReadToEnd())
+    )
+    $request = [System.Management.Automation.PSSerializer]::Deserialize($requestXml)
+    $worker = [scriptblock]::Create($request.WorkerScript)
+    $pasted = & $worker -JsonText $request.JsonText -DescriptionParagraph $request.DescriptionParagraph -TimeoutSeconds $request.TimeoutSeconds
+    if ($pasted -eq $true) { exit 0 }
+    exit 1
+}
+catch {
+    exit 1
+}
+'@
+        $airtableEncodedBootstrap = [Convert]::ToBase64String(
+            [System.Text.Encoding]::Unicode.GetBytes($airtableWorkerBootstrap)
+        )
+
+        # Windows PowerShell includes the .NET Framework UI Automation stack.
+        # Use its full path so this also works when the GUI runs from PS7/ISE.
+        $airtablePowerShellPath = Join-Path -Path ([Environment]::GetFolderPath('System')) `
+            -ChildPath 'WindowsPowerShell\v1.0\powershell.exe'
+        $airtableStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $airtableStartInfo.FileName = $airtablePowerShellPath
+        $airtableStartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -WindowStyle Hidden -EncodedCommand ' + $airtableEncodedBootstrap
+        $airtableStartInfo.UseShellExecute = $false
+        $airtableStartInfo.CreateNoWindow = $true
+        $airtableStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $airtableStartInfo.RedirectStandardInput = $true
+
+        $airtableWorkerProcess = New-Object System.Diagnostics.Process
+        $airtableWorkerProcess.StartInfo = $airtableStartInfo
+        $airtableWorkerStarted = $airtableWorkerProcess.Start()
+        if (-not $airtableWorkerStarted) {
+            return $false
+        }
+
+        $airtableWorkerProcess.StandardInput.Write($airtableRequestBase64)
+        $airtableWorkerProcess.StandardInput.Close()
+
+        # Allow startup/paste overhead, but stop a stalled accessibility call
+        # so the hidden worker cannot linger and paste into a later session.
+        $airtableWorkerWaitMs = ($TimeoutSeconds + 15) * 1000
+        if (-not $airtableWorkerProcess.WaitForExit($airtableWorkerWaitMs)) {
+            return $false
+        }
+
+        return ($airtableWorkerProcess.ExitCode -eq 0)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $airtableWorkerProcess) {
+            try {
+                if ($airtableWorkerStarted -and -not $airtableWorkerProcess.HasExited) {
+                    $airtableWorkerProcess.Kill()
+                    [void]$airtableWorkerProcess.WaitForExit(2000)
+                }
+            }
+            catch {
+                # The worker may already have exited between the check and Kill.
+            }
+            finally {
+                $airtableWorkerProcess.Dispose()
+            }
+        }
+    }
 }
 
 # Find the first complete, valid JSON object or array in pasted Stellar text.
@@ -363,11 +481,9 @@ function Get-StellarAlertDescription {
     return ($stellarDescriptionValues -join "`r`n`r`n")
 }
 
-# Recalculate and then lock the text bounds of controls that were originally
-# AutoSize. Windows Forms can repaint those controls with a smaller cached box
-# after Chrome/Airtable takes focus, which clips the ends of labels and the
-# bottom line of the private-IP reference.
-function Repair-SocToolsTextBounds {
+# Measure and lock the startup text bounds once. Do not remeasure controls
+# after browser focus changes; the window keeps its original layout and scale.
+function Initialize-SocToolsTextBounds {
     param(
         [object[]]$Controls,
         [System.Windows.Forms.Form]$Form
@@ -385,9 +501,8 @@ function Repair-SocToolsTextBounds {
                 continue
             }
 
-            # Preserve the last known-good bounds before asking Windows for a
-            # fresh preferred size. A later DPI repaint may report a smaller
-            # preferred size, but this control is never allowed to shrink.
+            # Keep the designed bounds if they are already larger than the
+            # preferred text size, and add a little space for the final glyph.
             $socCurrentWidth = $socControl.Width
             $socCurrentHeight = $socControl.Height
 
@@ -3392,12 +3507,6 @@ $stellarButton.Add_Click({
         )
     }
 
-    # Chrome can return focus with stale AutoSize bounds. Refresh and lock the
-    # full text sizes before the user returns to the Home or IP Lookup tabs.
-    Repair-SocToolsTextBounds `
-        -Controls $socToolsTextBoundsControls `
-        -Form $mainForm
-
     <# OLD OVERSIZED-JSON ALERT - DISABLED
     if ($stellarJsonNeedsManualPaste -and $stellarJsonText) {
         try {
@@ -3491,16 +3600,8 @@ $socToolsTextBoundsControls = @(
     $ipSummaryLabel
 )
 
-# Refresh the affected text bounds whenever SOC Tools regains focus after
-# Chrome/Airtable, including when the JSON automation times out.
-$mainForm.Add_Activated({
-    Repair-SocToolsTextBounds `
-        -Controls $socToolsTextBoundsControls `
-        -Form $mainForm
-})
-
 # Calculate the correct bounds once at startup and lock them before display.
-Repair-SocToolsTextBounds `
+Initialize-SocToolsTextBounds `
     -Controls $socToolsTextBoundsControls `
     -Form $mainForm
 

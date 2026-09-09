@@ -8,16 +8,14 @@ Add-Type -AssemblyName System.Web
 # This function runs ONLY in the separate PowerShell worker below. Loading or
 # using UI Automation in the GUI process can initialize WPF's DPI awareness
 # after the form is already visible, changing its scale and checkbox rendering.
-# Focus Airtable's rich-text JSON editor by its accessibility name, paste the
-# complete JSON, then paste Stellar's alert paragraph at the beginning of
-# Description. The cursor is left on the first blank line after the paragraph.
+# Focus Airtable's rich-text JSON editor by its accessibility name and paste the
+# complete JSON. Description is already complete in the Airtable URL, so the
+# worker only focuses that field and leaves its cursor at the end for typing.
 # If Airtable has not finished loading, retry until the timeout expires.
 function Invoke-AirtableJsonFieldWorker {
     param(
         [Parameter(Mandatory = $true)]
         [string]$JsonText,
-
-        [string]$DescriptionParagraph = "",
 
         [int]$TimeoutSeconds = 20
     )
@@ -84,9 +82,9 @@ function Invoke-AirtableJsonFieldWorker {
                                 Start-Sleep -Milliseconds 150
                                 [System.Windows.Forms.SendKeys]::SendWait("^v")
 
-                                # After JSON is pasted, return to Description
-                                # and insert the alert paragraph before the
-                                # existing leading blank lines and template.
+                                # Description arrived as one complete URL-prefilled
+                                # value. Focus it for the analyst and move only the
+                                # caret; do not modify its rich-text contents.
                                 Start-Sleep -Milliseconds 250
                                 $airtableDescriptionElements = $airtableSearchRoot.FindAll(
                                     [System.Windows.Automation.TreeScope]::Descendants,
@@ -110,28 +108,7 @@ function Invoke-AirtableJsonFieldWorker {
                                         ) {
                                             $airtableDescriptionElement.SetFocus()
                                             Start-Sleep -Milliseconds 150
-                                            [System.Windows.Forms.SendKeys]::SendWait("^{HOME}")
-
-                                            if (-not [string]::IsNullOrWhiteSpace($DescriptionParagraph)) {
-                                                try {
-                                                    # Paste only the paragraph so no new whitespace
-                                                    # is added to Description.
-                                                    [System.Windows.Forms.Clipboard]::SetText(
-                                                        $DescriptionParagraph.TrimEnd()
-                                                    )
-                                                    Start-Sleep -Milliseconds 100
-                                                    [System.Windows.Forms.SendKeys]::SendWait("^v")
-
-                                                    # Cross two existing newlines so one completely
-                                                    # blank line remains between the paragraph and cursor.
-                                                    Start-Sleep -Milliseconds 75
-                                                    [System.Windows.Forms.SendKeys]::SendWait("{RIGHT 2}")
-                                                }
-                                                catch {
-                                                    # JSON was already pasted. Leave Description
-                                                    # focused even if the paragraph paste fails.
-                                                }
-                                            }
+                                            [System.Windows.Forms.SendKeys]::SendWait("^{END}")
 
                                             return $true
                                         }
@@ -170,8 +147,6 @@ function Set-AirtableJsonField {
         [Parameter(Mandatory = $true)]
         [string]$JsonText,
 
-        [string]$DescriptionParagraph = "",
-
         [ValidateRange(1, 300)]
         [int]$TimeoutSeconds = 20
     )
@@ -190,7 +165,6 @@ function Set-AirtableJsonField {
         $airtableWorkerRequest = @{
             WorkerScript = ${function:Invoke-AirtableJsonFieldWorker}.ToString()
             JsonText = $JsonText
-            DescriptionParagraph = $DescriptionParagraph
             TimeoutSeconds = $TimeoutSeconds
         }
         $airtableRequestXml = [System.Management.Automation.PSSerializer]::Serialize(
@@ -210,7 +184,7 @@ try {
     )
     $request = [System.Management.Automation.PSSerializer]::Deserialize($requestXml)
     $worker = [scriptblock]::Create($request.WorkerScript)
-    $pasted = & $worker -JsonText $request.JsonText -DescriptionParagraph $request.DescriptionParagraph -TimeoutSeconds $request.TimeoutSeconds
+    $pasted = & $worker -JsonText $request.JsonText -TimeoutSeconds $request.TimeoutSeconds
     if ($pasted -eq $true) { exit 0 }
     exit 1
 }
@@ -3308,9 +3282,18 @@ $stellarButton.Add_Click({
     }
 
     $stellarSupportingNotesText = $stellarNotesTemplate
-    # Keep three blank lines at the beginning. After the form opens, the alert
-    # paragraph is pasted into this space without increasing the URL length.
-    $stellarDescriptionText = "`r`n`r`n`r`n" + $stellarSupportingNotesText
+
+    # Send Description to Airtable as one complete URL-prefilled value. Keeping
+    # the alert paragraph and template in one value prevents Airtable's rich-text
+    # editor from saving later typing at a stale insertion point.
+    if ([string]::IsNullOrWhiteSpace($stellarAlertDescription)) {
+        $stellarDescriptionText = $stellarSupportingNotesText
+    }
+    else {
+        $stellarDescriptionText = $stellarAlertDescription.TrimEnd() +
+                                  "`r`n`r`n" +
+                                  $stellarSupportingNotesText
+    }
 
     # -----------------------------
     # KILL CHAIN STAGE + MITRE TACTIC
@@ -3497,12 +3480,11 @@ $stellarButton.Add_Click({
 
     Start-Process "chrome.exe" $stellarFinalUrl
 
-    # Paste the complete JSON after Airtable loads, then put the alert paragraph
-    # at the top of Description. Neither value increases the URL length.
+    # Paste only the complete JSON after Airtable loads. Description was already
+    # sent in the URL; focus it and leave the caret at the end for the analyst.
     if ($stellarJsonText) {
         [void](Set-AirtableJsonField `
             -JsonText $stellarJsonText `
-            -DescriptionParagraph $stellarAlertDescription `
             -TimeoutSeconds 20
         )
     }

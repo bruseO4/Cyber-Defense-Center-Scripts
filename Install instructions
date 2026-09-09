@@ -7,6 +7,6 @@ powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File (copied file pa
 
 If done correctly the icon should turn into the powershell logo 
 When they run they will make there own files: 
-IP lookup script: lookup history and lookup settings 
+IP lookup script: lookup history and lookup settings (the api keys will need to be created check IP summary notes)
 Stellar Airtable: Stellar Airtable Analysts
 Home Page: SOC clock state and tracker settings

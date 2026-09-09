@@ -1,0 +1,17 @@
+In order to get the rest of the APIs to work you will need to make a json file: 
+IP-Lookup-API-Keys.json 
+
+It should like look like this: 
+
+{
+  "IPINFO_TOKEN": "paste-your-ipinfo-token-here",
+  "OTX_API_KEY": "paste-your-levelblue-otx-key-here",
+  "VIRUSTOTAL_API_KEY": "paste-your-virustotal-key-here",
+  "ABUSEIPDB_API_KEY": "paste-your-abuseipdb-key-here"
+}
+
+All of these are free! The quota limits are far beyond what we will be using. 
+https://ipinfo.io/dashboard/token 
+https://otx.alienvault.com/api
+https://www.virustotal.com/gui/user/"account name"/apikey
+https://www.abuseipdb.com/account/api/keys

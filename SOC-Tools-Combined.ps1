@@ -9,8 +9,8 @@ Add-Type -AssemblyName System.Web
 # using UI Automation in the GUI process can initialize WPF's DPI awareness
 # after the form is already visible, changing its scale and checkbox rendering.
 # Focus Airtable's rich-text JSON editor by its accessibility name and paste the
-# complete JSON. Description is already complete in the Airtable URL, so the
-# worker only focuses that field and leaves its cursor at the end for typing.
+# complete JSON. Issue is already complete in the Airtable URL, so the worker
+# focuses that field and leaves its cursor at the end for typing.
 # If Airtable has not finished loading, retry until the timeout expires.
 function Invoke-AirtableJsonFieldWorker {
     param(
@@ -82,31 +82,31 @@ function Invoke-AirtableJsonFieldWorker {
                                 Start-Sleep -Milliseconds 150
                                 [System.Windows.Forms.SendKeys]::SendWait("^v")
 
-                                # Description arrived as one complete URL-prefilled
-                                # value. Focus it for the analyst and move only the
+                                # Issue arrived as one complete URL-prefilled value.
+                                # Focus it for the analyst and move only the
                                 # caret; do not modify its rich-text contents.
                                 Start-Sleep -Milliseconds 250
-                                $airtableDescriptionElements = $airtableSearchRoot.FindAll(
+                                $airtableIssueElements = $airtableSearchRoot.FindAll(
                                     [System.Windows.Automation.TreeScope]::Descendants,
                                     [System.Windows.Automation.Condition]::TrueCondition
                                 )
 
                                 for (
-                                    $airtableDescriptionIndex = 0;
-                                    $airtableDescriptionIndex -lt $airtableDescriptionElements.Count;
-                                    $airtableDescriptionIndex++
+                                    $airtableIssueIndex = 0;
+                                    $airtableIssueIndex -lt $airtableIssueElements.Count;
+                                    $airtableIssueIndex++
                                 ) {
-                                    $airtableDescriptionElement = $airtableDescriptionElements.Item(
-                                        $airtableDescriptionIndex
+                                    $airtableIssueElement = $airtableIssueElements.Item(
+                                        $airtableIssueIndex
                                     )
 
                                     try {
                                         if (
-                                            $airtableDescriptionElement.Current.Name -ieq "Description:" -and
-                                            $airtableDescriptionElement.Current.IsEnabled -and
-                                            $airtableDescriptionElement.Current.IsKeyboardFocusable
+                                            $airtableIssueElement.Current.Name -ieq "Issue:" -and
+                                            $airtableIssueElement.Current.IsEnabled -and
+                                            $airtableIssueElement.Current.IsKeyboardFocusable
                                         ) {
-                                            $airtableDescriptionElement.SetFocus()
+                                            $airtableIssueElement.SetFocus()
                                             Start-Sleep -Milliseconds 150
                                             [System.Windows.Forms.SendKeys]::SendWait("^{END}")
 
@@ -114,7 +114,7 @@ function Invoke-AirtableJsonFieldWorker {
                                         }
                                     }
                                     catch {
-                                        # Airtable can refresh Description while focus changes.
+                                        # Airtable can refresh Issue while focus changes.
                                     }
                                 }
 
@@ -880,9 +880,14 @@ $stellarTab = New-Object System.Windows.Forms.TabPage
 $stellarTab.Text = "Stellar to Airtable"
 $stellarTab.BackColor = [System.Drawing.Color]::FromArgb(32, 34, 37)
 
+$caseIpTab = New-Object System.Windows.Forms.TabPage
+$caseIpTab.Text = "Case IP Lookups"
+$caseIpTab.BackColor = [System.Drawing.Color]::FromArgb(245, 248, 252)
+
 [void]$tabControl.TabPages.Add($homeTab)
 [void]$tabControl.TabPages.Add($ipTab)
 [void]$tabControl.TabPages.Add($stellarTab)
+[void]$tabControl.TabPages.Add($caseIpTab)
 $mainForm.Controls.Add($tabControl)
 
 # ============================================================
@@ -1299,6 +1304,66 @@ function Invoke-IpLookupJsonRequest {
         -ErrorAction Stop
 }
 
+# Extract one canonical IPv4 or IPv6 address from common analyst input. This
+# accepts raw addresses, URLs, a missing URL colon such as https/8.8.8.8/,
+# trailing punctuation, IPv4 ports, and bracketed IPv6 addresses with ports.
+function ConvertTo-NormalizedIpAddress {
+    param(
+        [string]$InputText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InputText)) {
+        return $null
+    }
+
+    $candidate = $InputText.Trim()
+
+    # Remove surrounding prose punctuation without damaging IPv6 colons.
+    $candidate = $candidate -replace '^[\s''"<>\(\{]+', ''
+    $candidate = $candidate -replace '[\s''"<>\)\},;]+$', ''
+
+    # Accept http://, https://, and the common missing-colon form https/.
+    $candidate = $candidate -replace '(?i)^(?:https?|hxxps?)\s*:?[\\/]+', ''
+
+    # A URL containing IPv6 must normally enclose the address in brackets.
+    if ($candidate -match '^\[(?<Address>[^\]]+)\](?::\d+)?(?:[/?#].*)?[.,;]?$') {
+        $candidate = $matches['Address']
+    }
+    else {
+        # Remove a URL path, query, or fragment. A raw IPv6 address does not
+        # use any of these delimiters.
+        $candidate = ($candidate -split '[/?#]', 2)[0]
+
+        # Remove :port only from an IPv4-looking host. Colons inside a raw IPv6
+        # address are preserved.
+        if ($candidate -match '^(?<Address>\d{1,3}(?:\.\d{1,3}){3}):\d+$') {
+            $candidate = $matches['Address']
+        }
+    }
+
+    # Analysts often paste a sentence-ending period with an otherwise valid IP.
+    $candidate = $candidate.Trim().TrimEnd(
+        [char[]]@('.', ',', ';', ')', ']', '}', '>', '"', "'")
+    )
+
+    $parsedAddress = $null
+    $looksLikeIpv4 = $candidate -match '^\d{1,3}(?:\.\d{1,3}){3}$'
+    $looksLikeIpv6 = $candidate.Contains(':')
+
+    if (
+        ($looksLikeIpv4 -or $looksLikeIpv6) -and
+        [System.Net.IPAddress]::TryParse($candidate, [ref]$parsedAddress)
+    ) {
+        if ($parsedAddress.IsIPv4MappedToIPv6) {
+            $parsedAddress = $parsedAddress.MapToIPv4()
+        }
+
+        return $parsedAddress.ToString()
+    }
+
+    return $null
+}
+
 function Test-IpAddressIsPublic {
     param(
         [Parameter(Mandatory = $true)]
@@ -1344,6 +1409,148 @@ function Test-IpAddressIsPublic {
     }
 
     return $false
+}
+
+function Get-IpAddressSourceLabel {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text,
+
+        [Parameter(Mandatory = $true)]
+        [int]$MatchIndex
+    )
+
+    $lineStart = $Text.LastIndexOf("`n", [Math]::Max(0, $MatchIndex - 1))
+    if ($lineStart -lt 0) {
+        $lineStart = 0
+    }
+    else {
+        $lineStart++
+    }
+
+    $prefixLength = [Math]::Max(0, $MatchIndex - $lineStart)
+    $linePrefix = $Text.Substring($lineStart, $prefixLength)
+    # Preserve the exact JSON/property name immediately before the address.
+    # Example:  "srcip2": "198.51.100.20"  becomes the label srcip2.
+    $fieldMatch = [regex]::Match(
+        $linePrefix,
+        '(?i)(?<Field>[a-z_][a-z0-9_.-]*)\s*["'']?\s*[:=]\s*["'']?\s*$'
+    )
+
+    if ($fieldMatch.Success) {
+        return $fieldMatch.Groups['Field'].Value
+    }
+
+    if ($linePrefix -match '(?i)(?:https?|hxxps?)\s*:?[\\/]+\s*$') {
+        return "URL"
+    }
+
+    return "Alert text"
+}
+
+# Find every unique literal IPv4 and IPv6 address in copied Stellar text. Each
+# result includes its source field(s), parsed value, and public/private status.
+function Get-IpAddressesFromText {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return @()
+    }
+
+    $candidateMatches = @()
+
+    # Broad IPv4 candidates are validated by IPAddress.TryParse below.
+    foreach ($match in [regex]::Matches(
+        $Text,
+        '(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'
+    )) {
+        $candidateMatches += [PSCustomObject]@{
+            Index = $match.Index
+            Value = $match.Value
+        }
+    }
+
+    # Collect colon-containing tokens, then let IPAddress.TryParse distinguish
+    # IPv6 from timestamps, MAC addresses, and ordinary text.
+    foreach ($match in [regex]::Matches(
+        $Text,
+        '(?i)(?<![0-9a-f:.%])[0-9a-f:.%]*:[0-9a-f:.%]+(?![0-9a-f:.%])'
+    )) {
+        $candidateMatches += [PSCustomObject]@{
+            Index = $match.Index
+            Value = $match.Value
+        }
+    }
+
+    # Use native PowerShell collections here for full Windows PowerShell 5.1
+    # compatibility. Generic HashSet constructor behavior differs between the
+    # .NET Framework and newer PowerShell/.NET versions.
+    $recordsByAddress = @{}
+    $orderedAddressKeys = @()
+
+    foreach ($candidateMatch in @($candidateMatches | Sort-Object Index)) {
+        $normalizedAddress = ConvertTo-NormalizedIpAddress `
+            -InputText $candidateMatch.Value
+
+        $addressKey = [string]$normalizedAddress
+        if (-not [string]::IsNullOrWhiteSpace($addressKey)) {
+            $addressKey = $addressKey.ToLowerInvariant()
+        }
+
+        if ([string]::IsNullOrWhiteSpace($normalizedAddress)) {
+            continue
+        }
+
+        $sourceLabel = Get-IpAddressSourceLabel `
+            -Text $Text `
+            -MatchIndex $candidateMatch.Index
+
+        if ($recordsByAddress.ContainsKey($addressKey)) {
+            $existingRecord = $recordsByAddress[$addressKey]
+            if ($existingRecord.SourceLabels -notcontains $sourceLabel) {
+                $existingRecord.SourceLabels = @($existingRecord.SourceLabels) + $sourceLabel
+            }
+            continue
+        }
+
+        $parsedAddress = $null
+        if (-not [System.Net.IPAddress]::TryParse(
+            $normalizedAddress,
+            [ref]$parsedAddress
+        )) {
+            continue
+        }
+
+        $isPublicAddress = Test-IpAddressIsPublic -Address $parsedAddress
+
+        $recordsByAddress[$addressKey] = [PSCustomObject]@{
+            Address       = $normalizedAddress
+            ParsedAddress = $parsedAddress
+            IsPublic      = [bool]$isPublicAddress
+            SourceLabels  = @($sourceLabel)
+        }
+        $orderedAddressKeys += $addressKey
+    }
+
+    $results = @(
+        foreach ($addressKey in $orderedAddressKeys) {
+            $record = $recordsByAddress[$addressKey]
+            $sourceDisplay = @($record.SourceLabels) -join ", "
+
+            [PSCustomObject]@{
+                Address       = $record.Address
+                ParsedAddress = $record.ParsedAddress
+                IsPublic      = $record.IsPublic
+                SourceLabels  = @($record.SourceLabels)
+                Source        = $sourceDisplay
+                Display       = "$($record.Address)  [$sourceDisplay]"
+            }
+        }
+    )
+
+    return $results
 }
 
 function Get-IpLookupCountryName {
@@ -1448,13 +1655,25 @@ function Test-IpLookupValueReported {
     return $true
 }
 
+function ConvertTo-IpLookupYesNo {
+    param($Value)
+
+    if ([bool]$Value) {
+        return "Yes"
+    }
+
+    return "No"
+}
+
 function Get-IpThreatLocationSummary {
     param(
         [Parameter(Mandatory = $true)]
         [string]$IpAddress,
 
         [Parameter(Mandatory = $true)]
-        [System.Net.IPAddress]$ParsedAddress
+        [System.Net.IPAddress]$ParsedAddress,
+
+        [switch]$ImportantOnly
     )
 
     $newLine = [Environment]::NewLine
@@ -1521,21 +1740,65 @@ function Get-IpThreatLocationSummary {
         $ipInfoRegion = [string]$ipInfo.region
         $ipInfoCountry = [string]$ipInfo.country
         $ipInfoCountryCode = [string]$ipInfo.country_code
-        $ipInfoAsn = [string]$ipInfo.asn
+        $ipInfoAsn = $null
         $ipInfoAsName = [string]$ipInfo.as_name
         $ipInfoAsDomain = [string]$ipInfo.as_domain
+        $ipInfoAsType = $null
+        $ipInfoNetworkRange = $null
+        $ipInfoContinent = [string]$ipInfo.continent
+        $ipInfoContinentCode = [string]$ipInfo.continent_code
+        $ipInfoLatitude = $null
+        $ipInfoLongitude = $null
+        $ipInfoPostalCode = [string]$ipInfo.postal
+        $ipInfoTimeZone = [string]$ipInfo.timezone
+
+        if ($null -ne $ipInfo.asn) {
+            if ($ipInfo.asn -is [string] -or $ipInfo.asn -is [ValueType]) {
+                $ipInfoAsn = [string]$ipInfo.asn
+            }
+            else {
+                $ipInfoAsn = [string]$ipInfo.asn.asn
+                if ([string]::IsNullOrWhiteSpace($ipInfoAsName)) { $ipInfoAsName = [string]$ipInfo.asn.name }
+                if ([string]::IsNullOrWhiteSpace($ipInfoAsDomain)) { $ipInfoAsDomain = [string]$ipInfo.asn.domain }
+                $ipInfoAsType = [string]$ipInfo.asn.type
+                $ipInfoNetworkRange = [string]$ipInfo.asn.route
+            }
+        }
 
         if ($null -ne $ipInfo.geo) {
             if ([string]::IsNullOrWhiteSpace($ipInfoCity)) { $ipInfoCity = [string]$ipInfo.geo.city }
             if ([string]::IsNullOrWhiteSpace($ipInfoRegion)) { $ipInfoRegion = [string]$ipInfo.geo.region }
             if ([string]::IsNullOrWhiteSpace($ipInfoCountry)) { $ipInfoCountry = [string]$ipInfo.geo.country }
             if ([string]::IsNullOrWhiteSpace($ipInfoCountryCode)) { $ipInfoCountryCode = [string]$ipInfo.geo.country_code }
+            if ($null -ne $ipInfo.geo.continent -and $ipInfo.geo.continent -isnot [string]) {
+                if ([string]::IsNullOrWhiteSpace($ipInfoContinent)) { $ipInfoContinent = [string]$ipInfo.geo.continent.name }
+                if ([string]::IsNullOrWhiteSpace($ipInfoContinentCode)) { $ipInfoContinentCode = [string]$ipInfo.geo.continent.code }
+            }
+            elseif ([string]::IsNullOrWhiteSpace($ipInfoContinent)) {
+                $ipInfoContinent = [string]$ipInfo.geo.continent
+            }
+            if ([string]::IsNullOrWhiteSpace($ipInfoContinentCode)) { $ipInfoContinentCode = [string]$ipInfo.geo.continent_code }
+            if ([string]::IsNullOrWhiteSpace($ipInfoPostalCode)) { $ipInfoPostalCode = [string]$ipInfo.geo.postal_code }
+            if ([string]::IsNullOrWhiteSpace($ipInfoTimeZone)) { $ipInfoTimeZone = [string]$ipInfo.geo.timezone }
+            if (Test-IpLookupValueReported -InputObject $ipInfo.geo -PropertyName "latitude") { $ipInfoLatitude = $ipInfo.geo.latitude }
+            if (Test-IpLookupValueReported -InputObject $ipInfo.geo -PropertyName "longitude") { $ipInfoLongitude = $ipInfo.geo.longitude }
         }
 
         if ($null -ne $ipInfo.as) {
             if ([string]::IsNullOrWhiteSpace($ipInfoAsn)) { $ipInfoAsn = [string]$ipInfo.as.asn }
             if ([string]::IsNullOrWhiteSpace($ipInfoAsName)) { $ipInfoAsName = [string]$ipInfo.as.name }
             if ([string]::IsNullOrWhiteSpace($ipInfoAsDomain)) { $ipInfoAsDomain = [string]$ipInfo.as.domain }
+            if ([string]::IsNullOrWhiteSpace($ipInfoAsType)) { $ipInfoAsType = [string]$ipInfo.as.type }
+            if ([string]::IsNullOrWhiteSpace($ipInfoNetworkRange)) { $ipInfoNetworkRange = [string]$ipInfo.as.route }
+        }
+
+        if (
+            ($null -eq $ipInfoLatitude -or $null -eq $ipInfoLongitude) -and
+            -not [string]::IsNullOrWhiteSpace([string]$ipInfo.loc) -and
+            [string]$ipInfo.loc -match '^\s*([^,]+),\s*(.+)\s*$'
+        ) {
+            $ipInfoLatitude = $matches[1]
+            $ipInfoLongitude = $matches[2]
         }
 
         # The legacy response stores a two-letter code in country. Newer
@@ -1599,15 +1862,49 @@ function Get-IpThreatLocationSummary {
             }
         }
 
-        $ipInfoCityRegion = @(
-            $ipInfoCity
-            $ipInfoRegion
-        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-
         $ipInfoDetails = @("Status: $ipInfoDataTier data received.")
 
-        if (-not [string]::IsNullOrWhiteSpace($ipInfoCountryDisplay)) {
-            $ipInfoDetails += "Country: $ipInfoCountryDisplay"
+        $ipInfoLocationDisplay = @(
+            $ipInfoCity
+            $ipInfoRegion
+            $ipInfoCountryDisplay
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+
+        if ($ipInfoLocationDisplay.Count -gt 0) {
+            $ipInfoDetails += "Location: $($ipInfoLocationDisplay -join ', ')"
+        }
+
+        if (
+            $null -ne $ipInfoLatitude -and
+            $null -ne $ipInfoLongitude
+        ) {
+            $ipInfoDetails += "Coordinates: $ipInfoLatitude, $ipInfoLongitude"
+        }
+
+        $ipInfoContinentDisplay = $ipInfoContinent
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoContinentCode)) {
+            if ([string]::IsNullOrWhiteSpace($ipInfoContinentDisplay)) {
+                $ipInfoContinentDisplay = $ipInfoContinentCode
+            }
+            elseif ($ipInfoContinentDisplay -notmatch "\($([regex]::Escape($ipInfoContinentCode))\)$") {
+                $ipInfoContinentDisplay += " ($ipInfoContinentCode)"
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoContinentDisplay)) {
+            $ipInfoDetails += "Continent: $ipInfoContinentDisplay"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoPostalCode)) {
+            $ipInfoDetails += "Postal code: $ipInfoPostalCode"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoTimeZone)) {
+            $ipInfoDetails += "Time zone: $ipInfoTimeZone"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($hostname)) {
+            $ipInfoDetails += "Domain name / reverse DNS: $hostname"
         }
 
         if (-not [string]::IsNullOrWhiteSpace($ipInfoAsn)) {
@@ -1622,26 +1919,36 @@ function Get-IpThreatLocationSummary {
             $ipInfoDetails += "Organization domain: $ipInfoAsDomain"
         }
 
-        if ($ipInfoCityRegion.Count -gt 0) {
-            $ipInfoDetails += "City/region: $($ipInfoCityRegion -join ', ')"
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoNetworkRange)) {
+            $ipInfoDetails += "Network range: $ipInfoNetworkRange"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ipInfoAsType)) {
+            $ipInfoDetails += "ASN type: $ipInfoAsType"
         }
 
         $ipInfoFlagFields = [ordered]@{
-            "Anycast"                    = "anycast"
-            "Anonymous/VPN/proxy/Tor"    = "is_anonymous"
-            "Hosting/data center"        = "is_hosting"
-            "Mobile carrier"             = "is_mobile"
-            "Bogon/reserved"             = "bogon"
+            "Anycast"                 = "anycast"
+            "Anonymous infrastructure" = "is_anonymous"
+            "Hosting/data center"     = "is_hosting"
+            "Mobile carrier"          = "is_mobile"
+            "Satellite provider"      = "is_satellite"
+            "Bogon/reserved"          = "bogon"
         }
+
+        $ipInfoThreatFlags = @()
 
         foreach ($flagLabel in $ipInfoFlagFields.Keys) {
             $flagPropertyName = $ipInfoFlagFields[$flagLabel]
             $flagProperty = $ipInfo.PSObject.Properties[$flagPropertyName]
 
-            if ($null -ne $flagProperty -and $flagProperty.Value -eq $true) {
-                $ipInfoDetails += "$flagLabel`: Yes"
+            if ($null -ne $flagProperty -and $null -ne $flagProperty.Value) {
+                $ipInfoThreatFlags += "$flagLabel=$(
+                    ConvertTo-IpLookupYesNo -Value $flagProperty.Value
+                )"
 
-                switch ($flagPropertyName) {
+                if ($flagProperty.Value -eq $true) {
+                    switch ($flagPropertyName) {
                     "anycast" {
                         $socSignals += "IPinfo marks the address as anycast; physical location may vary by requester."
                     }
@@ -1654,8 +1961,62 @@ function Get-IpThreatLocationSummary {
                     "is_mobile" {
                         $socSignals += "IPinfo identifies a mobile-carrier address; attribution may be shared or temporary."
                     }
+                    }
                 }
             }
+        }
+
+        if (
+            $null -eq $ipInfo.PSObject.Properties["anycast"] -and
+            (Test-IpLookupValueReported -InputObject $ipInfo -PropertyName "is_anycast")
+        ) {
+            $ipInfoThreatFlags += "Anycast=$(ConvertTo-IpLookupYesNo -Value $ipInfo.is_anycast)"
+        }
+
+        if ($null -ne $ipInfo.anonymous) {
+            $ipInfoAnonymousFields = [ordered]@{
+                "VPN"   = "is_vpn"
+                "Proxy" = "is_proxy"
+                "Tor"   = "is_tor"
+                "Relay" = "is_relay"
+            }
+
+            foreach ($flagLabel in $ipInfoAnonymousFields.Keys) {
+                $flagPropertyName = $ipInfoAnonymousFields[$flagLabel]
+                if (Test-IpLookupValueReported -InputObject $ipInfo.anonymous -PropertyName $flagPropertyName) {
+                    $ipInfoThreatFlags += "$flagLabel=$(
+                        ConvertTo-IpLookupYesNo -Value $ipInfo.anonymous.$flagPropertyName
+                    )"
+                }
+            }
+        }
+
+        if ($null -ne $ipInfo.privacy) {
+            $ipInfoPrivacyFields = [ordered]@{
+                "VPN"     = "vpn"
+                "Proxy"   = "proxy"
+                "Tor"     = "tor"
+                "Relay"   = "relay"
+                "Hosting" = "hosting"
+            }
+
+            foreach ($flagLabel in $ipInfoPrivacyFields.Keys) {
+                $flagPropertyName = $ipInfoPrivacyFields[$flagLabel]
+                if (Test-IpLookupValueReported -InputObject $ipInfo.privacy -PropertyName $flagPropertyName) {
+                    $flagText = "$flagLabel=$(ConvertTo-IpLookupYesNo -Value $ipInfo.privacy.$flagPropertyName)"
+                    if ($ipInfoThreatFlags -notcontains $flagText) {
+                        $ipInfoThreatFlags += $flagText
+                    }
+                }
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$ipInfo.privacy.service)) {
+                $ipInfoThreatFlags += "Privacy service=$($ipInfo.privacy.service)"
+            }
+        }
+
+        if ($ipInfoThreatFlags.Count -gt 0) {
+            $ipInfoDetails += "Threat/context flags: $($ipInfoThreatFlags -join '; ')"
         }
     }
     catch {
@@ -1678,6 +2039,27 @@ function Get-IpThreatLocationSummary {
 
         $otxUri = "https://otx.alienvault.com/api/v1/indicators/$otxIndicatorType/$encodedIp/general"
         $otx = Invoke-IpLookupJsonRequest -Uri $otxUri -Headers $otxHeaders
+        $otxPassiveDnsNames = @()
+
+        try {
+            $otxPassiveDnsUri = "https://otx.alienvault.com/api/v1/indicators/$otxIndicatorType/$encodedIp/passive_dns"
+            $otxPassiveDns = Invoke-IpLookupJsonRequest -Uri $otxPassiveDnsUri -Headers $otxHeaders
+            $otxPassiveDnsNames = @(
+                @($otxPassiveDns.passive_dns) |
+                    ForEach-Object {
+                        ConvertTo-IpLookupSingleLine -Value $_.hostname -MaximumLength 120
+                    } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Sort-Object -Unique |
+                    Select-Object -First 10
+            )
+        }
+        catch {
+            # Passive DNS is supplementary. Keep the general OTX result when
+            # this endpoint has no history, is rate-limited, or is unavailable.
+            $otxPassiveDnsNames = @()
+        }
+
         $otxPulseCount = $null
         $otxHasPulseCount = $false
         $otxHasAssessment = $false
@@ -1751,13 +2133,55 @@ function Get-IpThreatLocationSummary {
         }
 
         $otxDetails = @("Status: Threat-intelligence data received.")
+        $otxCountryName = [string]$otx.country_name
+        $otxCountryCode = [string]$otx.country_code
+        $otxLocationParts = @(
+            [string]$otx.city
+            [string]$otx.region
+            $otxCountryName
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
 
+        if ($otxLocationParts.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($otxCountryCode)) {
+            $otxLocationParts = @(Get-IpLookupCountryName -CountryCode $otxCountryCode)
+        }
+
+        if ($otxLocationParts.Count -gt 0) {
+            $otxLocationDisplay = $otxLocationParts -join ", "
+            if (
+                -not [string]::IsNullOrWhiteSpace($otxCountryCode) -and
+                $otxLocationDisplay -notmatch "\($([regex]::Escape($otxCountryCode))\)$"
+            ) {
+                $otxLocationDisplay += " ($otxCountryCode)"
+            }
+            $otxDetails += "Location: $otxLocationDisplay"
+        }
+
+        if (
+            (Test-IpLookupValueReported -InputObject $otx -PropertyName "latitude") -and
+            (Test-IpLookupValueReported -InputObject $otx -PropertyName "longitude")
+        ) {
+            $otxDetails += "Coordinates: $($otx.latitude), $($otx.longitude)"
+        }
+
+        if ($otxPassiveDnsNames.Count -gt 0) {
+            $otxDetails += "Domain names / passive DNS (up to 10): $($otxPassiveDnsNames -join ', ')"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$otx.asn)) {
+            $otxDetails += "ASN / network owner: $($otx.asn)"
+        }
+
+        $otxThreatParts = @()
         if ($otxHasPulseCount) {
-            $otxDetails += "Related pulses: $otxPulseCount"
+            $otxThreatParts += "Related pulses=$otxPulseCount"
         }
 
         if (-not [string]::IsNullOrWhiteSpace($otxReputation)) {
-            $otxDetails += "Reputation: $otxReputation"
+            $otxThreatParts += "Reputation=$otxReputation"
+        }
+
+        if ($otxThreatParts.Count -gt 0) {
+            $otxDetails += "Threat detection: $($otxThreatParts -join '; ')"
         }
 
         if ($otxPulseNames.Count -gt 0) {
@@ -1877,17 +2301,111 @@ function Get-IpThreatLocationSummary {
             }
 
             $virusTotalDetails = @("Status: Reputation data received.")
-            $virusTotalVerdictParts = @()
+            $virusTotalCountryCode = [string]$virusTotalAttributes.country
+            $virusTotalCountryName = Get-IpLookupCountryName -CountryCode $virusTotalCountryCode
+            $virusTotalContinent = [string]$virusTotalAttributes.continent
+            $virusTotalLocationParts = @(
+                $virusTotalCountryName
+                $virusTotalContinent
+            ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
 
-            if ($virusTotalHasMalicious) { $virusTotalVerdictParts += "Malicious=$virusTotalMalicious" }
-            if ($virusTotalHasSuspicious) { $virusTotalVerdictParts += "Suspicious=$virusTotalSuspicious" }
+            if ($virusTotalLocationParts.Count -gt 0) {
+                $virusTotalLocationDisplay = $virusTotalLocationParts -join ", "
+                if (
+                    -not [string]::IsNullOrWhiteSpace($virusTotalCountryCode) -and
+                    $virusTotalLocationDisplay -notmatch "\($([regex]::Escape($virusTotalCountryCode))\)"
+                ) {
+                    $virusTotalLocationDisplay += " ($virusTotalCountryCode)"
+                }
+                $virusTotalDetails += "Location: $virusTotalLocationDisplay"
+            }
+
+            $virusTotalDomainNames = @()
+            if (Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "last_dns_records") {
+                $virusTotalDomainNames = @(
+                    foreach ($dnsRecord in @($virusTotalAttributes.last_dns_records)) {
+                        $dnsValue = ConvertTo-IpLookupSingleLine -Value $dnsRecord.value -MaximumLength 150
+                        $dnsParsedAddress = $null
+
+                        if (
+                            -not [string]::IsNullOrWhiteSpace($dnsValue) -and
+                            -not [System.Net.IPAddress]::TryParse($dnsValue, [ref]$dnsParsedAddress)
+                        ) {
+                            $dnsValue
+                        }
+                    }
+                ) | Sort-Object -Unique | Select-Object -First 10
+            }
+
+            $virusTotalCertificateName = $null
+            if (
+                $null -ne $virusTotalAttributes.last_https_certificate -and
+                $null -ne $virusTotalAttributes.last_https_certificate.subject
+            ) {
+                $virusTotalCertificateName = ConvertTo-IpLookupSingleLine `
+                    -Value $virusTotalAttributes.last_https_certificate.subject.CN `
+                    -MaximumLength 150
+            }
+
+            if ($virusTotalDomainNames.Count -gt 0) {
+                $virusTotalDetails += "Domain names / recent DNS (up to 10): $($virusTotalDomainNames -join ', ')"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($virusTotalCertificateName)) {
+                $virusTotalDetails += "HTTPS certificate name: $virusTotalCertificateName"
+            }
+
+            if (Test-IpLookupValueReported -InputObject $virusTotalAttributes -PropertyName "asn") {
+                $virusTotalDetails += "ASN: AS$($virusTotalAttributes.asn)"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.as_owner)) {
+                $virusTotalDetails += "Network owner: $($virusTotalAttributes.as_owner)"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.network)) {
+                $virusTotalDetails += "Network range: $($virusTotalAttributes.network)"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.regional_internet_registry)) {
+                $virusTotalDetails += "Regional registry: $($virusTotalAttributes.regional_internet_registry)"
+            }
+
+            $virusTotalVerdictParts = @()
+            $virusTotalVerdictFields = [ordered]@{
+                "Malicious"  = "malicious"
+                "Suspicious" = "suspicious"
+                "Harmless"   = "harmless"
+                "Undetected" = "undetected"
+                "Timeout"    = "timeout"
+            }
+
+            foreach ($verdictLabel in $virusTotalVerdictFields.Keys) {
+                $verdictPropertyName = $virusTotalVerdictFields[$verdictLabel]
+                if (Test-IpLookupValueReported -InputObject $virusTotalStats -PropertyName $verdictPropertyName) {
+                    $virusTotalVerdictParts += "$verdictLabel=$($virusTotalStats.$verdictPropertyName)"
+                }
+            }
 
             if ($virusTotalVerdictParts.Count -gt 0) {
-                $virusTotalDetails += "Engine verdicts: $($virusTotalVerdictParts -join '; ')"
+                $virusTotalDetails += "Threat detection: $($virusTotalVerdictParts -join '; ')"
             }
 
             if ($virusTotalHasReputation) {
                 $virusTotalDetails += "Community reputation: $virusTotalReputation (negative is suspicious; positive is favorable)"
+            }
+
+            if ($null -ne $virusTotalAttributes.total_votes) {
+                $virusTotalVoteParts = @()
+                if (Test-IpLookupValueReported -InputObject $virusTotalAttributes.total_votes -PropertyName "malicious") {
+                    $virusTotalVoteParts += "Malicious=$($virusTotalAttributes.total_votes.malicious)"
+                }
+                if (Test-IpLookupValueReported -InputObject $virusTotalAttributes.total_votes -PropertyName "harmless") {
+                    $virusTotalVoteParts += "Harmless=$($virusTotalAttributes.total_votes.harmless)"
+                }
+                if ($virusTotalVoteParts.Count -gt 0) {
+                    $virusTotalDetails += "Community votes: $($virusTotalVoteParts -join '; ')"
+                }
             }
 
             if (-not [string]::IsNullOrWhiteSpace($virusTotalLastAnalysis)) {
@@ -1900,6 +2418,10 @@ function Get-IpThreatLocationSummary {
 
             if ($virusTotalTags.Count -gt 0) {
                 $virusTotalDetails += "Tags (up to 12): $($virusTotalTags -join ', ')"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.jarm)) {
+                $virusTotalDetails += "JARM fingerprint: $($virusTotalAttributes.jarm)"
             }
 
             if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace([string]$virusTotalAttributes.as_owner)) {
@@ -1985,10 +2507,8 @@ function Get-IpThreatLocationSummary {
                 $socSignals += "AbuseIPDB identifies this address as a Tor exit node."
             }
 
-            # Country code/name are resolved later when the shared location
-            # summary is built; keeping duplicate variables here is unnecessary.
-            # $abuseCountryCode = [string]$abuseData.countryCode
-            # $abuseCountryName = Get-IpLookupCountryName -CountryCode $abuseCountryCode
+            $abuseCountryCode = [string]$abuseData.countryCode
+            $abuseCountryName = Get-IpLookupCountryName -CountryCode $abuseCountryCode
             $abuseHostnames = @(
                 $abuseData.hostnames |
                     ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 100 } |
@@ -2003,51 +2523,76 @@ function Get-IpThreatLocationSummary {
             }
 
             $abuseIpDbDetails = @("Status: Abuse-report data received.")
-
-            if ($abuseHasScore) {
-                $abuseIpDbDetails += "Abuse confidence: $abuseScore%"
+            if (-not [string]::IsNullOrWhiteSpace($abuseCountryName)) {
+                $abuseLocationDisplay = $abuseCountryName
+                if (
+                    -not [string]::IsNullOrWhiteSpace($abuseCountryCode) -and
+                    $abuseLocationDisplay -notmatch "\($([regex]::Escape($abuseCountryCode))\)$"
+                ) {
+                    $abuseLocationDisplay += " ($abuseCountryCode)"
+                }
+                $abuseIpDbDetails += "Location: $abuseLocationDisplay"
             }
 
-            if ($abuseHasReports) {
-                $abuseIpDbDetails += "Reports in last 90 days: $abuseReports"
+            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.domain)) {
+                $abuseIpDbDetails += "Domain name: $($abuseData.domain)"
             }
 
-            if ($abuseHasDistinctUsers) {
-                $abuseIpDbDetails += "Distinct reporters: $abuseDistinctUsers"
+            if ($abuseHostnames.Count -gt 0) {
+                $abuseIpDbDetails += "Hostnames (up to 3): $($abuseHostnames -join ', ')"
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($abuseLastReported)) {
-                $abuseIpDbDetails += "Last reported: $abuseLastReported"
-            }
-
-            if (
-                (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isTor") -and
-                $abuseData.isTor -eq $true
-            ) {
-                $abuseIpDbDetails += "Tor exit node: Yes"
-            }
-
-            if (
-                (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isWhitelisted") -and
-                $abuseData.isWhitelisted -eq $true
-            ) {
-                $abuseIpDbDetails += "Whitelisted by AbuseIPDB: Yes"
+            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.isp)) {
+                $abuseIpDbDetails += "Network owner / ISP: $($abuseData.isp)"
             }
 
             if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.usageType)) {
                 $abuseIpDbDetails += "Usage type: $($abuseData.usageType)"
             }
 
-            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.isp)) {
-                $abuseIpDbDetails += "ISP: $($abuseData.isp)"
+            $abuseThreatParts = @()
+
+            if ($abuseHasScore) {
+                $abuseThreatParts += "Abuse confidence=$abuseScore%"
             }
 
-            if (-not [string]::IsNullOrWhiteSpace([string]$abuseData.domain)) {
-                $abuseIpDbDetails += "Domain: $($abuseData.domain)"
+            if ($abuseHasReports) {
+                $abuseThreatParts += "Reports in 90 days=$abuseReports"
             }
 
-            if ($abuseHostnames.Count -gt 0) {
-                $abuseIpDbDetails += "Hostnames (up to 3): $($abuseHostnames -join ', ')"
+            if ($abuseHasDistinctUsers) {
+                $abuseThreatParts += "Distinct reporters=$abuseDistinctUsers"
+            }
+
+            if (
+                Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isTor"
+            ) {
+                $abuseThreatParts += "Tor exit node=$(ConvertTo-IpLookupYesNo -Value $abuseData.isTor)"
+            }
+
+            if (
+                Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isWhitelisted"
+            ) {
+                $abuseThreatParts += "Whitelisted=$(ConvertTo-IpLookupYesNo -Value $abuseData.isWhitelisted)"
+            }
+
+            if ($abuseThreatParts.Count -gt 0) {
+                $abuseIpDbDetails += "Threat detection: $($abuseThreatParts -join '; ')"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($abuseLastReported)) {
+                $abuseIpDbDetails += "Last reported: $abuseLastReported"
+            }
+
+            $abuseAddressFacts = @()
+            if (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "ipVersion") {
+                $abuseAddressFacts += "IPv$($abuseData.ipVersion)"
+            }
+            if (Test-IpLookupValueReported -InputObject $abuseData -PropertyName "isPublic") {
+                $abuseAddressFacts += "Public=$(ConvertTo-IpLookupYesNo -Value $abuseData.isPublic)"
+            }
+            if ($abuseAddressFacts.Count -gt 0) {
+                $abuseIpDbDetails += "Address classification: $($abuseAddressFacts -join '; ')"
             }
 
             if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace([string]$abuseData.isp)) {
@@ -2094,6 +2639,35 @@ function Get-IpThreatLocationSummary {
         }
     }
 
+    # Tab 4 uses the compact SOC view. Each provider remains separate, but
+    # secondary enrichment fields are removed so the analyst can scan the
+    # location, ownership, domain, and threat findings quickly.
+    if ($ImportantOnly) {
+        $ipInfoDetails = @(
+            $ipInfoDetails | Where-Object {
+                [string]$_ -match '^(Status|Location|Domain name / reverse DNS|ASN|Organization|Organization domain|Network range|Threat/context flags):'
+            }
+        )
+
+        $otxDetails = @(
+            $otxDetails | Where-Object {
+                [string]$_ -match '^(Status|Location|Domain names / passive DNS|ASN / network owner|Threat detection|Pulse names|Tags):'
+            }
+        )
+
+        $virusTotalDetails = @(
+            $virusTotalDetails | Where-Object {
+                [string]$_ -match '^(Status|Location|Domain names / recent DNS|HTTPS certificate name|ASN|Network owner|Network range|Threat detection|Community reputation|Last analysis|Flagging engines|Tags):'
+            }
+        )
+
+        $abuseIpDbDetails = @(
+            $abuseIpDbDetails | Where-Object {
+                [string]$_ -match '^(Status|Location|Domain name|Hostnames|Network owner / ISP|Usage type|Threat detection|Last reported):'
+            }
+        )
+    }
+
     $summaryLines = @(
         "IP: $IpAddress"
         "OVERALL: $overall"
@@ -2118,7 +2692,7 @@ function Get-IpThreatLocationSummary {
         $combinedAttributionDetails += "Hostname: $hostname"
     }
 
-    if ($combinedAttributionDetails.Count -gt 0) {
+    if (-not $ImportantOnly -and $combinedAttributionDetails.Count -gt 0) {
         $summaryLines += ""
         $summaryLines += "COMBINED ATTRIBUTION"
         $summaryLines += $combinedAttributionDetails
@@ -2173,25 +2747,6 @@ $ipTextBox.Size = New-Object System.Drawing.Size(250,25)
 
 # Sets the position of the text box
 $ipTextBox.Location = New-Object System.Drawing.Point(20,50)
-
-
-# ------------------------------------------------------------
-# BACKSPACE = CLEAR ENTIRE SEARCH BOX
-# ------------------------------------------------------------
-
-# Detects when a key is pressed while typing in the IP box
-$ipTextBox.Add_KeyDown({
-
-    # Checks whether the Backspace key was pressed
-    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Back) {
-
-        # Clears the entire IP address instead of deleting one character
-        $ipTextBox.Clear()
-
-        # Stops Windows from performing the normal Backspace action
-        $_.SuppressKeyPress = $true
-    }
-})
 
 
 # ------------------------------------------------------------
@@ -2541,33 +3096,12 @@ $ipRunLookupAction = {
         [bool]$OpenWebsites
     )
 
-    # Gets the IP address from the search box
-    # Gets whatever the user entered
-$ipInputText = $ipTextBox.Text.Trim()
+    # Normalize raw IPv4/IPv6 values, URLs, ports, and pasted punctuation.
+    $ipOriginalInput = $ipTextBox.Text
+    $ipIp = ConvertTo-NormalizedIpAddress -InputText $ipOriginalInput
 
-
-# --------------------------------------------------------
-# NORMALIZE IP INPUT
-# --------------------------------------------------------
-
-# Removes http:// or https:// if present
-$ipInputText = $ipInputText -replace '^https?://', ''
-
-# Removes anything after a forward slash
-# Example: 8.8.8.8/test becomes 8.8.8.8
-$ipInputText = $ipInputText.Split('/')[0]
-
-# Removes a port number from IPv4 addresses
-# Example: 8.8.8.8:443 becomes 8.8.8.8
-if ($ipInputText -match '^(\d{1,3}(?:\.\d{1,3}){3}):\d+$') {
-    $ipInputText = $matches[1]
-}
-
-# The cleaned result becomes the IP used by the rest of the program
-$ipIp = $ipInputText.Trim()
-
-# Updates the search box so you can see what was extracted
-$ipTextBox.Text = $ipIp
+    # Updates the search box so the extracted canonical address is visible.
+    $ipTextBox.Text = [string]$ipIp
 
     # Creates a variable PowerShell will use to validate the IP
     $ipValidIP = $null
@@ -2578,11 +3112,14 @@ $ipTextBox.Text = $ipIp
     # --------------------------------------------------------
 
     # Checks whether the entered text is a valid IPv4 or IPv6 address
-    if (-not [System.Net.IPAddress]::TryParse($ipIp, [ref]$ipValidIP)) {
+    if (
+        [string]::IsNullOrWhiteSpace($ipIp) -or
+        -not [System.Net.IPAddress]::TryParse($ipIp, [ref]$ipValidIP)
+    ) {
 
         # Shows an error popup if the IP is invalid
         [System.Windows.Forms.MessageBox]::Show(
-            "'$ipIp' is not a valid IP address.",
+            "'$($ipOriginalInput.Trim())' does not contain a valid IPv4 or IPv6 address.",
             "Invalid IP"
         )
 
@@ -2824,6 +3361,256 @@ $stellarTextBox.Multiline = $true
 $stellarTextBox.ScrollBars = "Vertical"
 $stellarTab.Controls.Add($stellarTextBox)
 
+# ============================================================
+# CASE IP LOOKUPS TAB
+# ============================================================
+
+$caseIpInstructions = New-Object System.Windows.Forms.Label
+$caseIpInstructions.Text = "Press Fill Airtable on the Stellar tab to collect and look up the case IP addresses."
+$caseIpInstructions.AutoSize = $false
+$caseIpInstructions.Size = New-Object System.Drawing.Size(660, 24)
+$caseIpInstructions.Location = New-Object System.Drawing.Point(20, 18)
+$caseIpInstructions.ForeColor = [System.Drawing.Color]::FromArgb(35, 45, 55)
+$caseIpTab.Controls.Add($caseIpInstructions)
+
+$caseIpPrivateLabel = New-Object System.Windows.Forms.Label
+$caseIpPrivateLabel.Text = "Private / Reserved (0)"
+$caseIpPrivateLabel.AutoSize = $true
+$caseIpPrivateLabel.Location = New-Object System.Drawing.Point(20, 52)
+$caseIpPrivateLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 90, 35)
+$caseIpTab.Controls.Add($caseIpPrivateLabel)
+
+$caseIpPublicLabel = New-Object System.Windows.Forms.Label
+$caseIpPublicLabel.Text = "Public (0)"
+$caseIpPublicLabel.AutoSize = $true
+$caseIpPublicLabel.Location = New-Object System.Drawing.Point(365, 52)
+$caseIpPublicLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 95, 160)
+$caseIpTab.Controls.Add($caseIpPublicLabel)
+
+$caseIpPrivateList = New-Object System.Windows.Forms.ListBox
+$caseIpPrivateList.Size = New-Object System.Drawing.Size(315, 135)
+$caseIpPrivateList.Location = New-Object System.Drawing.Point(20, 75)
+$caseIpPrivateList.HorizontalScrollbar = $true
+$caseIpPrivateList.BackColor = [System.Drawing.Color]::White
+$caseIpPrivateList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+$caseIpTab.Controls.Add($caseIpPrivateList)
+
+$caseIpPublicList = New-Object System.Windows.Forms.ListBox
+$caseIpPublicList.Size = New-Object System.Drawing.Size(315, 135)
+$caseIpPublicList.Location = New-Object System.Drawing.Point(365, 75)
+$caseIpPublicList.HorizontalScrollbar = $true
+$caseIpPublicList.BackColor = [System.Drawing.Color]::White
+$caseIpPublicList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+$caseIpTab.Controls.Add($caseIpPublicList)
+
+$caseIpRunButton = New-Object System.Windows.Forms.Button
+$caseIpRunButton.Text = "Look Up All Public IPs"
+$caseIpRunButton.Size = New-Object System.Drawing.Size(180, 32)
+$caseIpRunButton.Location = New-Object System.Drawing.Point(20, 225)
+$caseIpRunButton.FlatStyle = "Flat"
+$caseIpRunButton.FlatAppearance.BorderSize = 0
+$caseIpRunButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$caseIpRunButton.ForeColor = [System.Drawing.Color]::White
+$caseIpRunButton.Enabled = $false
+$caseIpTab.Controls.Add($caseIpRunButton)
+
+$caseIpCopyButton = New-Object System.Windows.Forms.Button
+$caseIpCopyButton.Text = "Copy Results"
+$caseIpCopyButton.Size = New-Object System.Drawing.Size(110, 32)
+$caseIpCopyButton.Location = New-Object System.Drawing.Point(210, 225)
+$caseIpCopyButton.FlatStyle = "Flat"
+$caseIpCopyButton.FlatAppearance.BorderSize = 0
+$caseIpCopyButton.BackColor = [System.Drawing.Color]::FromArgb(90, 105, 120)
+$caseIpCopyButton.ForeColor = [System.Drawing.Color]::White
+$caseIpCopyButton.Enabled = $false
+$caseIpTab.Controls.Add($caseIpCopyButton)
+
+$caseIpStatusLabel = New-Object System.Windows.Forms.Label
+$caseIpStatusLabel.Text = "No Stellar case text has been pasted yet."
+$caseIpStatusLabel.AutoSize = $false
+$caseIpStatusLabel.Size = New-Object System.Drawing.Size(345, 32)
+$caseIpStatusLabel.Location = New-Object System.Drawing.Point(335, 225)
+$caseIpStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$caseIpStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(75, 85, 95)
+$caseIpTab.Controls.Add($caseIpStatusLabel)
+
+$caseIpResultsBox = New-Object System.Windows.Forms.TextBox
+$caseIpResultsBox.Location = New-Object System.Drawing.Point(20, 270)
+$caseIpResultsBox.Size = New-Object System.Drawing.Size(660, 350)
+$caseIpResultsBox.Multiline = $true
+$caseIpResultsBox.ScrollBars = "Vertical"
+$caseIpResultsBox.BackColor = [System.Drawing.Color]::White
+$caseIpResultsBox.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+$caseIpResultsBox.BorderStyle = "FixedSingle"
+$caseIpResultsBox.Font = New-Object System.Drawing.Font("Consolas", 10)
+$caseIpResultsBox.Text = "Public-IP results from IPinfo, LevelBlue OTX, VirusTotal, and AbuseIPDB will appear here."
+$caseIpTab.Controls.Add($caseIpResultsBox)
+
+$caseIpAddressByDisplay = @{}
+
+# Clicking either list copies the exact IPv4 or IPv6 address that was clicked.
+$caseIpPrivateList.Add_MouseClick({
+    param($listControl, $mouseClickEvent)
+
+    $clickedIndex = $listControl.IndexFromPoint($mouseClickEvent.Location)
+    if ($clickedIndex -ge 0) {
+        $clickedDisplay = [string]$listControl.Items[$clickedIndex]
+        $clickedAddress = [string]$caseIpAddressByDisplay[$clickedDisplay]
+
+        if ([string]::IsNullOrWhiteSpace($clickedAddress)) {
+            $displayAddressPart = ($clickedDisplay -split '\s+\[', 2)[0]
+            $clickedAddress = ConvertTo-NormalizedIpAddress -InputText $displayAddressPart
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($clickedAddress)) {
+            [System.Windows.Forms.Clipboard]::SetText($clickedAddress)
+            $caseIpStatusLabel.Text = "Copied IP: $clickedAddress"
+        }
+    }
+})
+
+$caseIpPublicList.Add_MouseClick({
+    param($listControl, $mouseClickEvent)
+
+    $clickedIndex = $listControl.IndexFromPoint($mouseClickEvent.Location)
+    if ($clickedIndex -ge 0) {
+        $clickedDisplay = [string]$listControl.Items[$clickedIndex]
+        $clickedAddress = [string]$caseIpAddressByDisplay[$clickedDisplay]
+
+        if ([string]::IsNullOrWhiteSpace($clickedAddress)) {
+            $displayAddressPart = ($clickedDisplay -split '\s+\[', 2)[0]
+            $clickedAddress = ConvertTo-NormalizedIpAddress -InputText $displayAddressPart
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($clickedAddress)) {
+            [System.Windows.Forms.Clipboard]::SetText($clickedAddress)
+            $caseIpStatusLabel.Text = "Copied IP: $clickedAddress"
+        }
+    }
+})
+
+# Rebuild the two lists only when Fill Airtable is pressed. Exact duplicate
+# addresses are removed, and private/reserved values are never sent to an API.
+$caseIpRefreshAction = {
+    param([string]$Text)
+
+    $caseIpPrivateList.BeginUpdate()
+    $caseIpPublicList.BeginUpdate()
+
+    try {
+        $caseIpPrivateList.Items.Clear()
+        $caseIpPublicList.Items.Clear()
+        $caseIpAddressByDisplay.Clear()
+
+        foreach ($caseIpRecord in @(Get-IpAddressesFromText -Text $Text)) {
+            $caseIpDisplay = [string]$caseIpRecord.Display
+            $caseIpAddressByDisplay[$caseIpDisplay] = [string]$caseIpRecord.Address
+
+            if ($caseIpRecord.IsPublic) {
+                [void]$caseIpPublicList.Items.Add($caseIpDisplay)
+            }
+            else {
+                [void]$caseIpPrivateList.Items.Add($caseIpDisplay)
+            }
+        }
+    }
+    finally {
+        $caseIpPrivateList.EndUpdate()
+        $caseIpPublicList.EndUpdate()
+    }
+
+    $caseIpPrivateLabel.Text = "Private / Reserved ($($caseIpPrivateList.Items.Count))"
+    $caseIpPublicLabel.Text = "Public ($($caseIpPublicList.Items.Count))"
+    $caseIpRunButton.Enabled = ($caseIpPublicList.Items.Count -gt 0)
+    $caseIpCopyButton.Enabled = $false
+    $caseIpResultsBox.Text = "Public-IP results from IPinfo, LevelBlue OTX, VirusTotal, and AbuseIPDB will appear here."
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        $caseIpStatusLabel.Text = "No Stellar case text has been pasted yet."
+    }
+    else {
+        $caseIpTotalCount = $caseIpPrivateList.Items.Count + $caseIpPublicList.Items.Count
+        $caseIpStatusLabel.Text = "$caseIpTotalCount unique IP address(es) found."
+    }
+}
+
+$caseIpRunLookupAction = {
+    if ($caseIpPublicList.Items.Count -eq 0) {
+        return
+    }
+
+    # Always discard manual changes and rebuild the report from the APIs.
+    $caseIpResultsBox.Clear()
+    $caseIpRunButton.Enabled = $false
+    $caseIpCopyButton.Enabled = $false
+    $mainForm.UseWaitCursor = $true
+    $caseIpResultSections = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $caseIpLookupNumber = 0
+        $caseIpLookupTotal = $caseIpPublicList.Items.Count
+
+        foreach ($caseIpListItem in $caseIpPublicList.Items) {
+            $caseIpLookupNumber++
+            $caseIpDisplay = [string]$caseIpListItem
+            $caseIpAddress = [string]$caseIpAddressByDisplay[$caseIpDisplay]
+
+            if ([string]::IsNullOrWhiteSpace($caseIpAddress)) {
+                $displayAddressPart = ($caseIpDisplay -split '\s+\[', 2)[0]
+                $caseIpAddress = ConvertTo-NormalizedIpAddress -InputText $displayAddressPart
+            }
+
+            $caseIpStatusLabel.Text = "Looking up $caseIpLookupNumber of $caseIpLookupTotal`: $caseIpAddress"
+            [System.Windows.Forms.Application]::DoEvents()
+
+            $caseIpParsedAddress = $null
+            if (-not [System.Net.IPAddress]::TryParse(
+                $caseIpAddress,
+                [ref]$caseIpParsedAddress
+            )) {
+                continue
+            }
+
+            try {
+                $caseIpSummary = Get-IpThreatLocationSummary `
+                    -IpAddress $caseIpAddress `
+                    -ParsedAddress $caseIpParsedAddress `
+                    -ImportantOnly
+            }
+            catch {
+                $caseIpSummary = "IP: $caseIpAddress`r`nOVERALL: SUMMARY UNAVAILABLE"
+            }
+
+            [void]$caseIpResultSections.Add($caseIpSummary)
+            $caseIpResultsBox.Text = $caseIpResultSections -join (
+                "`r`n`r`n" + ("=" * 68) + "`r`n`r`n"
+            )
+            $caseIpResultsBox.SelectionStart = $caseIpResultsBox.Text.Length
+            $caseIpResultsBox.ScrollToCaret()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+
+        $caseIpResultsBox.SelectionStart = 0
+        $caseIpResultsBox.ScrollToCaret()
+        $caseIpCopyButton.Enabled = ($caseIpResultSections.Count -gt 0)
+        $caseIpStatusLabel.Text = "Finished $($caseIpResultSections.Count) public IP lookup(s)."
+    }
+    finally {
+        $mainForm.UseWaitCursor = $false
+        $caseIpRunButton.Enabled = ($caseIpPublicList.Items.Count -gt 0)
+    }
+}
+
+$caseIpRunButton.Add_Click({
+    & $caseIpRunLookupAction
+})
+
+$caseIpCopyButton.Add_Click({
+    if (-not [string]::IsNullOrWhiteSpace($caseIpResultsBox.Text)) {
+        [System.Windows.Forms.Clipboard]::SetText($caseIpResultsBox.Text)
+    }
+})
+
 # ==========================================
 # ANALYST CHECKLIST
 # ==========================================
@@ -2937,6 +3724,12 @@ $stellarButton.Add_MouseLeave({
 $stellarButton.Add_Click({
 
     $stellarText = $stellarTextBox.Text
+
+    # Collect the Ctrl+A case IPs at the moment the analyst submits the case,
+    # then show the fourth tab while the rest of the Airtable workflow runs.
+    & $caseIpRefreshAction -Text $stellarText
+    $tabControl.SelectedTab = $caseIpTab
+    [System.Windows.Forms.Application]::DoEvents()
 
     # -----------------------------
     # JSON DATA
@@ -3480,12 +4273,25 @@ $stellarButton.Add_Click({
 
     Start-Process "chrome.exe" $stellarFinalUrl
 
-    # Paste only the complete JSON after Airtable loads. Description was already
-    # sent in the URL; focus it and leave the caret at the end for the analyst.
+    # Paste only the complete JSON after Airtable loads. Issue was already sent
+    # in the URL; focus it and leave the caret at the end for the analyst.
     if ($stellarJsonText) {
         [void](Set-AirtableJsonField `
             -JsonText $stellarJsonText `
             -TimeoutSeconds 20
+        )
+    }
+
+    # Automatically build the same four-provider summary used by the normal
+    # IP Lookup tab for every public address found in the submitted case.
+    if ($caseIpPublicList.Items.Count -gt 0) {
+        & $caseIpRunLookupAction
+    }
+    else {
+        $caseIpStatusLabel.Text = "No public IP addresses were found in this case."
+        $caseIpResultsBox.Text = (
+            "No public IP addresses were sent to external services.`r`n" +
+            "Private and reserved addresses remain listed above."
         )
     }
 
@@ -3566,6 +4372,10 @@ $tabControl.Add_SelectedIndexChanged({
         $mainForm.AcceptButton = $stellarButton
         $stellarTextBox.Focus()
     }
+    elseif ($tabControl.SelectedTab -eq $caseIpTab) {
+        $mainForm.AcceptButton = $caseIpRunButton
+        $caseIpResultsBox.Focus()
+    }
 })
 
 $socToolsTextBoundsControls = @(
@@ -3580,6 +4390,8 @@ $socToolsTextBoundsControls = @(
     $ipSiteLabel
     $ipHistoryLabel
     $ipSummaryLabel
+    $caseIpPrivateLabel
+    $caseIpPublicLabel
 )
 
 # Calculate the correct bounds once at startup and lock them before display.

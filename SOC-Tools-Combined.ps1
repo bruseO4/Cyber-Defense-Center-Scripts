@@ -4088,6 +4088,10 @@ $stellarButton.Add_Click({
                                   $stellarSupportingNotesText
     }
 
+    # Description only: keep two blank lines after Recommendation for manual
+    # analyst notes. Supporting Notes remains unchanged.
+    $stellarDescriptionText += "`r`n`r`n"
+
     # -----------------------------
     # KILL CHAIN STAGE + MITRE TACTIC
     # Uses the FIRST Associated Alert

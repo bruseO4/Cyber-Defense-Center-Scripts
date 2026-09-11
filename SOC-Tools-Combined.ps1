@@ -80,6 +80,10 @@ function Invoke-AirtableJsonFieldWorker {
                             ) {
                                 $airtableElement.SetFocus()
                                 Start-Sleep -Milliseconds 150
+                                # Airtable must receive only the copied JSON.
+                                # Select the entire field first so any existing
+                                # blank/placeholder/prefilled content is replaced.
+                                [System.Windows.Forms.SendKeys]::SendWait("^a")
                                 [System.Windows.Forms.SendKeys]::SendWait("^v")
 
                                 # Issue arrived as one complete URL-prefilled value.

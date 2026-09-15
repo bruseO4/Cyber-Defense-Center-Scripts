@@ -8,14 +8,17 @@ Add-Type -AssemblyName System.Web
 # This function runs ONLY in the separate PowerShell worker below. Loading or
 # using UI Automation in the GUI process can initialize WPF's DPI awareness
 # after the form is already visible, changing its scale and checkbox rendering.
-# Focus Airtable's rich-text JSON editor by its accessibility name and paste the
-# complete JSON. Issue is already complete in the Airtable URL, so the worker
-# focuses that field and leaves its cursor at the end for typing.
+# Paste Description and JSON directly into Airtable's rich-text editors instead
+# of relying on URL-prefill formatting for the long Description value. Issue is
+# already complete in the Airtable URL, so the worker focuses that field and
+# leaves its cursor at the end for typing.
 # If Airtable has not finished loading, retry until the timeout expires.
 function Invoke-AirtableJsonFieldWorker {
     param(
         [Parameter(Mandatory = $true)]
         [string]$JsonText,
+
+        [string]$DescriptionText = "",
 
         [int]$TimeoutSeconds = 20
     )
@@ -78,11 +81,59 @@ function Invoke-AirtableJsonFieldWorker {
                                 $airtableElement.Current.IsEnabled -and
                                 $airtableElement.Current.IsKeyboardFocusable
                             ) {
+                                # Airtable's URL prefill can split long rich-text
+                                # Description values after the form is submitted.
+                                # Paste the whole Description through its editor
+                                # instead, using the same reliable path as JSON.
+                                if (-not [string]::IsNullOrWhiteSpace($DescriptionText)) {
+                                    $airtableDescriptionPasted = $false
+                                    $airtableDescriptionElements = $airtableSearchRoot.FindAll(
+                                        [System.Windows.Automation.TreeScope]::Descendants,
+                                        [System.Windows.Automation.Condition]::TrueCondition
+                                    )
+
+                                    for (
+                                        $airtableDescriptionIndex = 0;
+                                        $airtableDescriptionIndex -lt $airtableDescriptionElements.Count;
+                                        $airtableDescriptionIndex++
+                                    ) {
+                                        $airtableDescriptionElement = $airtableDescriptionElements.Item(
+                                            $airtableDescriptionIndex
+                                        )
+
+                                        try {
+                                            if (
+                                                $airtableDescriptionElement.Current.Name -ieq "Description:" -and
+                                                $airtableDescriptionElement.Current.IsEnabled -and
+                                                $airtableDescriptionElement.Current.IsKeyboardFocusable
+                                            ) {
+                                                $airtableDescriptionElement.SetFocus()
+                                                Start-Sleep -Milliseconds 150
+                                                [System.Windows.Forms.Clipboard]::SetText($DescriptionText)
+                                                [System.Windows.Forms.SendKeys]::SendWait("^a")
+                                                [System.Windows.Forms.SendKeys]::SendWait("^v")
+                                                $airtableDescriptionPasted = $true
+                                                break
+                                            }
+                                        }
+                                        catch {
+                                            # Airtable can replace Description while loading.
+                                        }
+                                    }
+
+                                    if (-not $airtableDescriptionPasted) {
+                                        # Wait for the Description editor rather than
+                                        # falling back to the unreliable URL prefill.
+                                        continue
+                                    }
+                                }
+
                                 $airtableElement.SetFocus()
                                 Start-Sleep -Milliseconds 150
                                 # Airtable must receive only the copied JSON.
                                 # Select the entire field first so any existing
                                 # blank/placeholder/prefilled content is replaced.
+                                [System.Windows.Forms.Clipboard]::SetText($JsonText)
                                 [System.Windows.Forms.SendKeys]::SendWait("^a")
                                 [System.Windows.Forms.SendKeys]::SendWait("^v")
 
@@ -151,6 +202,8 @@ function Set-AirtableJsonField {
         [Parameter(Mandatory = $true)]
         [string]$JsonText,
 
+        [string]$DescriptionText = "",
+
         [ValidateRange(1, 300)]
         [int]$TimeoutSeconds = 20
     )
@@ -169,6 +222,7 @@ function Set-AirtableJsonField {
         $airtableWorkerRequest = @{
             WorkerScript = ${function:Invoke-AirtableJsonFieldWorker}.ToString()
             JsonText = $JsonText
+            DescriptionText = $DescriptionText
             TimeoutSeconds = $TimeoutSeconds
         }
         $airtableRequestXml = [System.Management.Automation.PSSerializer]::Serialize(
@@ -188,7 +242,7 @@ try {
     )
     $request = [System.Management.Automation.PSSerializer]::Deserialize($requestXml)
     $worker = [scriptblock]::Create($request.WorkerScript)
-    $pasted = & $worker -JsonText $request.JsonText -TimeoutSeconds $request.TimeoutSeconds
+    $pasted = & $worker -JsonText $request.JsonText -DescriptionText $request.DescriptionText -TimeoutSeconds $request.TimeoutSeconds
     if ($pasted -eq $true) { exit 0 }
     exit 1
 }
@@ -250,6 +304,68 @@ catch {
             }
         }
     }
+}
+
+# Find the open BlackSwan/Stellar tab before building the Airtable prefill.
+# Chrome does not expose a dependable list of tab URLs to normal PowerShell,
+# so this checks each tab through the address bar. If it finds BlackSwan, that
+# tab remains selected. If it does not, it returns to the tab that was active
+# when the search began and returns an empty value.
+function Get-BlackSwanChromeUrl {
+    param(
+        [int]$MaxTabsToCheck = 30
+    )
+
+    $chromeShell = New-Object -ComObject WScript.Shell
+
+    if (-not $chromeShell.AppActivate("Google Chrome")) {
+        return ""
+    }
+
+    Start-Sleep -Milliseconds 150
+
+    $tabsMoved = 0
+
+    for ($tabIndex = 0; $tabIndex -lt $MaxTabsToCheck; $tabIndex++) {
+        [System.Windows.Forms.SendKeys]::SendWait("^l")
+        Start-Sleep -Milliseconds 75
+        [System.Windows.Forms.SendKeys]::SendWait("^c")
+        Start-Sleep -Milliseconds 100
+
+        $candidateUrl = [System.Windows.Forms.Clipboard]::GetText().Trim()
+        $isBlackSwanTab = $false
+
+        try {
+            $candidateUri = [System.Uri]$candidateUrl
+            $isBlackSwanTab = (
+                $candidateUri.Host -ieq "blackswan.stellarcyber.cloud" -or
+                $candidateUri.Host -ilike "*.blackswan.stellarcyber.cloud"
+            )
+        }
+        catch {
+            # A non-URL clipboard value is not a BlackSwan tab.
+        }
+
+        if ($isBlackSwanTab) {
+            # Keep the BlackSwan tab open and selected for the analyst.
+            return ($candidateUrl -split '\?')[0]
+        }
+
+        if ($tabIndex -lt ($MaxTabsToCheck - 1)) {
+            [System.Windows.Forms.SendKeys]::SendWait("^{TAB}")
+            $tabsMoved++
+            Start-Sleep -Milliseconds 125
+        }
+    }
+
+    # No BlackSwan tab was found. Put Chrome back where it started and leave
+    # the Stellar URL blank rather than accidentally prefilling another site.
+    for ($restoreIndex = 0; $restoreIndex -lt $tabsMoved; $restoreIndex++) {
+        [System.Windows.Forms.SendKeys]::SendWait("^+{TAB}")
+        Start-Sleep -Milliseconds 50
+    }
+
+    return ""
 }
 
 # Find the first complete, valid JSON object or array in pasted Stellar text.
@@ -3370,38 +3486,61 @@ $stellarTab.Controls.Add($stellarTextBox)
 # ============================================================
 
 $caseIpInstructions = New-Object System.Windows.Forms.Label
-$caseIpInstructions.Text = "Press Fill Airtable on the Stellar tab to collect and look up the case IP addresses."
+$caseIpInstructions.Text = "Paste complete JSON:"
 $caseIpInstructions.AutoSize = $false
-$caseIpInstructions.Size = New-Object System.Drawing.Size(660, 24)
-$caseIpInstructions.Location = New-Object System.Drawing.Point(20, 18)
+$caseIpInstructions.Size = New-Object System.Drawing.Size(300, 24)
+$caseIpInstructions.Location = New-Object System.Drawing.Point(20, 20)
 $caseIpInstructions.ForeColor = [System.Drawing.Color]::FromArgb(35, 45, 55)
 $caseIpTab.Controls.Add($caseIpInstructions)
+
+# This box lets the Case IP Lookups tab work on its own, without
+# first using Fill Airtable on the Stellar tab.
+$caseIpJsonInputBox = New-Object System.Windows.Forms.TextBox
+$caseIpJsonInputBox.Location = New-Object System.Drawing.Point(20, 48)
+$caseIpJsonInputBox.Size = New-Object System.Drawing.Size(660, 120)
+$caseIpJsonInputBox.Multiline = $true
+$caseIpJsonInputBox.ScrollBars = "Vertical"
+$caseIpJsonInputBox.BackColor = [System.Drawing.Color]::White
+$caseIpJsonInputBox.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+$caseIpJsonInputBox.BorderStyle = "FixedSingle"
+$caseIpJsonInputBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+$caseIpTab.Controls.Add($caseIpJsonInputBox)
+
+$caseIpCheckJsonButton = New-Object System.Windows.Forms.Button
+$caseIpCheckJsonButton.Text = "Check JSON"
+$caseIpCheckJsonButton.Size = New-Object System.Drawing.Size(140, 28)
+$caseIpCheckJsonButton.Location = New-Object System.Drawing.Point(540, 16)
+$caseIpCheckJsonButton.FlatStyle = "Flat"
+$caseIpCheckJsonButton.FlatAppearance.BorderSize = 0
+$caseIpCheckJsonButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$caseIpCheckJsonButton.ForeColor = [System.Drawing.Color]::White
+$caseIpTab.Controls.Add($caseIpCheckJsonButton)
 
 $caseIpPrivateLabel = New-Object System.Windows.Forms.Label
 $caseIpPrivateLabel.Text = "Private / Reserved (0)"
 $caseIpPrivateLabel.AutoSize = $true
-$caseIpPrivateLabel.Location = New-Object System.Drawing.Point(20, 52)
+$caseIpPrivateLabel.Location = New-Object System.Drawing.Point(20, 178)
 $caseIpPrivateLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 90, 35)
 $caseIpTab.Controls.Add($caseIpPrivateLabel)
 
 $caseIpPublicLabel = New-Object System.Windows.Forms.Label
 $caseIpPublicLabel.Text = "Public (0)"
 $caseIpPublicLabel.AutoSize = $true
-$caseIpPublicLabel.Location = New-Object System.Drawing.Point(365, 52)
+$caseIpPublicLabel.Location = New-Object System.Drawing.Point(365, 178)
 $caseIpPublicLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 95, 160)
 $caseIpTab.Controls.Add($caseIpPublicLabel)
 
 $caseIpPrivateList = New-Object System.Windows.Forms.ListBox
-$caseIpPrivateList.Size = New-Object System.Drawing.Size(315, 135)
-$caseIpPrivateList.Location = New-Object System.Drawing.Point(20, 75)
+$caseIpPrivateList.Size = New-Object System.Drawing.Size(315, 120)
+$caseIpPrivateList.Location = New-Object System.Drawing.Point(20, 200)
 $caseIpPrivateList.HorizontalScrollbar = $true
 $caseIpPrivateList.BackColor = [System.Drawing.Color]::White
 $caseIpPrivateList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
 $caseIpTab.Controls.Add($caseIpPrivateList)
 
 $caseIpPublicList = New-Object System.Windows.Forms.ListBox
-$caseIpPublicList.Size = New-Object System.Drawing.Size(315, 135)
-$caseIpPublicList.Location = New-Object System.Drawing.Point(365, 75)
+$caseIpPublicList.Size = New-Object System.Drawing.Size(315, 120)
+$caseIpPublicList.Location = New-Object System.Drawing.Point(365, 200)
 $caseIpPublicList.HorizontalScrollbar = $true
 $caseIpPublicList.BackColor = [System.Drawing.Color]::White
 $caseIpPublicList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
@@ -3410,7 +3549,7 @@ $caseIpTab.Controls.Add($caseIpPublicList)
 $caseIpRunButton = New-Object System.Windows.Forms.Button
 $caseIpRunButton.Text = "Look Up All Public IPs"
 $caseIpRunButton.Size = New-Object System.Drawing.Size(180, 32)
-$caseIpRunButton.Location = New-Object System.Drawing.Point(20, 225)
+$caseIpRunButton.Location = New-Object System.Drawing.Point(20, 335)
 $caseIpRunButton.FlatStyle = "Flat"
 $caseIpRunButton.FlatAppearance.BorderSize = 0
 $caseIpRunButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
@@ -3421,7 +3560,7 @@ $caseIpTab.Controls.Add($caseIpRunButton)
 $caseIpCopyButton = New-Object System.Windows.Forms.Button
 $caseIpCopyButton.Text = "Copy Results"
 $caseIpCopyButton.Size = New-Object System.Drawing.Size(110, 32)
-$caseIpCopyButton.Location = New-Object System.Drawing.Point(210, 225)
+$caseIpCopyButton.Location = New-Object System.Drawing.Point(210, 335)
 $caseIpCopyButton.FlatStyle = "Flat"
 $caseIpCopyButton.FlatAppearance.BorderSize = 0
 $caseIpCopyButton.BackColor = [System.Drawing.Color]::FromArgb(90, 105, 120)
@@ -3430,17 +3569,17 @@ $caseIpCopyButton.Enabled = $false
 $caseIpTab.Controls.Add($caseIpCopyButton)
 
 $caseIpStatusLabel = New-Object System.Windows.Forms.Label
-$caseIpStatusLabel.Text = "No Stellar case text has been pasted yet."
+$caseIpStatusLabel.Text = "Paste JSON and select Check JSON."
 $caseIpStatusLabel.AutoSize = $false
 $caseIpStatusLabel.Size = New-Object System.Drawing.Size(345, 32)
-$caseIpStatusLabel.Location = New-Object System.Drawing.Point(335, 225)
+$caseIpStatusLabel.Location = New-Object System.Drawing.Point(335, 335)
 $caseIpStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
 $caseIpStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(75, 85, 95)
 $caseIpTab.Controls.Add($caseIpStatusLabel)
 
 $caseIpResultsBox = New-Object System.Windows.Forms.TextBox
-$caseIpResultsBox.Location = New-Object System.Drawing.Point(20, 270)
-$caseIpResultsBox.Size = New-Object System.Drawing.Size(660, 350)
+$caseIpResultsBox.Location = New-Object System.Drawing.Point(20, 380)
+$caseIpResultsBox.Size = New-Object System.Drawing.Size(660, 240)
 $caseIpResultsBox.Multiline = $true
 $caseIpResultsBox.ScrollBars = "Vertical"
 $caseIpResultsBox.BackColor = [System.Drawing.Color]::White
@@ -3530,7 +3669,7 @@ $caseIpRefreshAction = {
     $caseIpResultsBox.Text = "Public-IP results from IPinfo, LevelBlue OTX, VirusTotal, and AbuseIPDB will appear here."
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
-        $caseIpStatusLabel.Text = "No Stellar case text has been pasted yet."
+        $caseIpStatusLabel.Text = "No case text or JSON has been pasted yet."
     }
     else {
         $caseIpTotalCount = $caseIpPrivateList.Items.Count + $caseIpPublicList.Items.Count
@@ -3607,6 +3746,32 @@ $caseIpRunLookupAction = {
 
 $caseIpRunButton.Add_Click({
     & $caseIpRunLookupAction
+})
+
+$caseIpCheckJsonButton.Add_Click({
+    $caseIpPastedJson = $caseIpJsonInputBox.Text
+
+    # Reuse the same IP extraction used by Fill Airtable, then immediately run
+    # the public-IP summaries so this tab can be used independently.
+    & $caseIpRefreshAction -Text $caseIpPastedJson
+
+    if ($caseIpPublicList.Items.Count -gt 0) {
+        & $caseIpRunLookupAction
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($caseIpPastedJson)) {
+        $caseIpStatusLabel.Text = "No public IP addresses were found in the pasted JSON."
+        $caseIpResultsBox.Text = (
+            "No public IP addresses were sent to external services.`r`n" +
+            "Private and reserved addresses remain listed above."
+        )
+    }
+})
+
+$caseIpJsonInputBox.Add_KeyDown({
+    if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $caseIpCheckJsonButton.PerformClick()
+        $_.SuppressKeyPress = $true
+    }
 })
 
 $caseIpCopyButton.Add_Click({
@@ -3795,38 +3960,9 @@ $stellarButton.Add_Click({
     # GET CURRENT CHROME URL
     # -----------------------------
 
-    $stellarUrlValue = ""
-
-    $stellarWshell = New-Object -ComObject WScript.Shell
-
-    # Activate Chrome
-    $stellarWshell.AppActivate("Google Chrome") | Out-Null
-
-    Start-Sleep -Milliseconds 150
-
-    # Focus address bar
-    [System.Windows.Forms.SendKeys]::SendWait("^l")
-
-    Start-Sleep -Milliseconds 75
-
-    # Copy current URL
-    [System.Windows.Forms.SendKeys]::SendWait("^c")
-
-    Start-Sleep -Milliseconds 100
-
-    # Read URL from clipboard
-    $stellarUrlValue = [System.Windows.Forms.Clipboard]::GetText()
-
-    #Check if URL is working
-    #[System.Windows.Forms.MessageBox]::Show("URL captured:`n$stellarUrlValue")
-    
-    # Read URL from clipboard
-    $stellarUrlValue = [System.Windows.Forms.Clipboard]::GetText()
-
-    # Remove the question mark and everything after it
-    if ($stellarUrlValue -match '\?') {
-        $stellarUrlValue = $stellarUrlValue.Split('?')[0]
-    }
+    # Use only a BlackSwan tab. The helper selects that tab when it finds one;
+    # otherwise this stays blank and Airtable receives no Stellar URL.
+    $stellarUrlValue = Get-BlackSwanChromeUrl
 
 
     
@@ -4207,9 +4343,9 @@ $stellarButton.Add_Click({
     }
 
 
-    # Airtable's exact form label is "Description:"; encode the colon in the key.
-    # Populate it every time, just like Supporting Notes.
-    $stellarParameters += "prefill_Description%3A=$([System.Web.HttpUtility]::UrlEncode($stellarDescriptionText))"
+    # Description is intentionally not URL-prefilled. Its long rich-text value
+    # is pasted directly after the form loads so Airtable does not split words
+    # or alter the Recommendation line when the form is submitted.
 
     # Supporting Notes should ALWAYS be populated
     $stellarParameters += "prefill_Supporting+Notes=$([System.Web.HttpUtility]::UrlEncode($stellarSupportingNotesText))"
@@ -4281,11 +4417,12 @@ $stellarButton.Add_Click({
 
     Start-Process "chrome.exe" $stellarFinalUrl
 
-    # Paste only the complete JSON after Airtable loads. Issue was already sent
-    # in the URL; focus it and leave the caret at the end for the analyst.
+    # Paste Description and the complete JSON after Airtable loads. Issue was
+    # already sent in the URL; focus it and leave the caret at the end.
     if ($stellarJsonText) {
         [void](Set-AirtableJsonField `
             -JsonText $stellarJsonText `
+            -DescriptionText $stellarDescriptionText `
             -TimeoutSeconds 20
         )
     }

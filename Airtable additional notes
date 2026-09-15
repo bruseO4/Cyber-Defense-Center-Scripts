@@ -1,4 +1,4 @@
-For this to work best use Kartsens view on blackswan:
+As of 9/15: For this to work best use Kartsens view on blackswan:
 Time - Stage - Tactic - File Hash - Actions
 
 
@@ -32,12 +32,11 @@ Analyst selection
 Supporting notes (have to fill out some parts manually)
 Issue (on 8/31 fixed with 3A trick along with desc and tenant)
 Tenant name:
-Description (have to fill out some parts manually)
-JSON (got it to work with a scripting after the airtable opens)
+
 
 These are the categories that work most of the time: 
 
-MITRE Tactic 
+MITRE Tactic (Likely fixed)
 1. Will work if the tactic is listed in airtable (now with all the mitre tactics this may work all the time)
 2. If the tactic is not listed and the kill chain stage is "Initial Attempts" it will fill in "Initial Access"
 3. If none of the above it will be blank
@@ -48,5 +47,10 @@ This is made up of if statements
 2. If "XDR" (case sensitve) appears it will be a "SIEM Correlation" 
 3. If none of the above it will be blank
 
+Description 
+1. have to fill out some parts manually 
+2. Had a recc (human text) ommendation bug likely fixed now by pasting it similar to json.
 
+JSON 
+1. Reported issue of it pasting in description and description not pasting however I had no problems with this.
 

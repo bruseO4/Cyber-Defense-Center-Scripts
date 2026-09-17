@@ -4001,7 +4001,7 @@ $formCopyTab.Controls.Add($formCopyFieldLabel)
 
 $formCopyPreviewLabel = New-Object System.Windows.Forms.Label
 $formCopyPreviewLabel.Text = "Full selected value"
-$formCopyPreviewLabel.Location = New-Object System.Drawing.Point(20, 405)
+$formCopyPreviewLabel.Location = New-Object System.Drawing.Point(20, 470)
 $formCopyPreviewLabel.Size = New-Object System.Drawing.Size(200, 22)
 $formCopyPreviewLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $formCopyPreviewLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 45, 55)
@@ -4009,7 +4009,7 @@ $formCopyTab.Controls.Add($formCopyPreviewLabel)
 
 $formCopyGrid = New-Object System.Windows.Forms.DataGridView
 $formCopyGrid.Location = New-Object System.Drawing.Point(20, 95)
-$formCopyGrid.Size = New-Object System.Drawing.Size(660, 300)
+$formCopyGrid.Size = New-Object System.Drawing.Size(660, 365)
 $formCopyGrid.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $formCopyGrid.BackgroundColor = [System.Drawing.Color]::White
 $formCopyGrid.ForeColor = [System.Drawing.Color]::FromArgb(35, 45, 55)
@@ -4037,8 +4037,8 @@ $formCopyGrid.Columns["Action"].SortMode = "NotSortable"
 $formCopyTab.Controls.Add($formCopyGrid)
 
 $formCopyPreviewBox = New-Object System.Windows.Forms.TextBox
-$formCopyPreviewBox.Location = New-Object System.Drawing.Point(20, 430)
-$formCopyPreviewBox.Size = New-Object System.Drawing.Size(660, 130)
+$formCopyPreviewBox.Location = New-Object System.Drawing.Point(20, 495)
+$formCopyPreviewBox.Size = New-Object System.Drawing.Size(660, 65)
 $formCopyPreviewBox.Multiline = $true
 $formCopyPreviewBox.ReadOnly = $true
 $formCopyPreviewBox.WordWrap = $true
@@ -4114,7 +4114,7 @@ $formCopyAllButton.Add_Click({
 })
 
 $formCopyOpenFormButton.Add_Click({
-    Start-Process "chrome.exe" -ArgumentList @($stellarGoogleFormUrl)
+    Start-Process "chrome.exe" -ArgumentList @("--new-window", "--start-maximized", $stellarGoogleFormUrl)
 })
 
 # ============================================================

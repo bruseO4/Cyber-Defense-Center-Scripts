@@ -2956,13 +2956,11 @@ $ipCopySummaryButton.Size = New-Object System.Drawing.Size(100,28)
 $ipCopySummaryButton.Location = New-Object System.Drawing.Point(590,18)
 $ipCopySummaryButton.Enabled = $false
 
-$ipSummaryBox = New-Object System.Windows.Forms.RichTextBox
+$ipSummaryBox = New-Object System.Windows.Forms.TextBox
 $ipSummaryBox.Location = New-Object System.Drawing.Point(400,50)
 $ipSummaryBox.Size = New-Object System.Drawing.Size(290,460)
-$ipSummaryBox.ReadOnly = $true
-$ipSummaryBox.WordWrap = $true
+$ipSummaryBox.Multiline = $true
 $ipSummaryBox.ScrollBars = "Vertical"
-$ipSummaryBox.DetectUrls = $false
 $ipSummaryBox.Text = "Run a lookup to see where the IP is from and whether threat-intelligence sources report it."
 $ipSummaryBox.Anchor = "Top, Bottom, Left, Right"
 
@@ -3175,7 +3173,7 @@ $ipSummaryLabel.ForeColor = [System.Drawing.Color]::FromArgb(35,95,160)
 $ipSummaryBox.BackColor = [System.Drawing.Color]::White
 $ipSummaryBox.ForeColor = [System.Drawing.Color]::FromArgb(35,35,35)
 $ipSummaryBox.BorderStyle = "FixedSingle"
-$ipSummaryBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$ipSummaryBox.Font = New-Object System.Drawing.Font("Consolas", 9)
 $ipCopySummaryButton.FlatStyle = "Flat"
 $ipCopySummaryButton.BackColor = [System.Drawing.Color]::FromArgb(90,105,120)
 $ipCopySummaryButton.ForeColor = [System.Drawing.Color]::White
@@ -3768,7 +3766,12 @@ $caseIpCheckJsonButton.Add_Click({
 })
 
 $caseIpJsonInputBox.Add_KeyDown({
-    if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+    # Match Tab 3: Backspace clears the whole pasted JSON box at once.
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Back) {
+        $caseIpJsonInputBox.Clear()
+        $_.SuppressKeyPress = $true
+    }
+    elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
         $caseIpCheckJsonButton.PerformClick()
         $_.SuppressKeyPress = $true
     }

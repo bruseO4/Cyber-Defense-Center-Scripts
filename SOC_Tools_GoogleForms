@@ -4449,6 +4449,16 @@ if ($stellarAnalystComboBox.Items.Count -gt 0) {
     $stellarAnalystComboBox.SelectedIndex = 0
 }
 
+$stellarRunCaseIpLookupCheckBox = New-Object System.Windows.Forms.CheckBox
+$stellarRunCaseIpLookupCheckBox.Text = "Run Case IP Lookup"
+$stellarRunCaseIpLookupCheckBox.Location = New-Object System.Drawing.Point(340, 448)
+$stellarRunCaseIpLookupCheckBox.Size = New-Object System.Drawing.Size(260, 25)
+$stellarRunCaseIpLookupCheckBox.Checked = $false
+$stellarRunCaseIpLookupCheckBox.AutoSize = $false
+$stellarRunCaseIpLookupCheckBox.BackColor = [System.Drawing.Color]::FromArgb(32, 34, 37)
+$stellarRunCaseIpLookupCheckBox.ForeColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
+$stellarTab.Controls.Add($stellarRunCaseIpLookupCheckBox)
+
 
 # ==========================================
 # PREPARE FORM FIELDS BUTTON
@@ -4505,9 +4515,14 @@ $stellarButton.Add_Click({
 
     $stellarText = $stellarTextBox.Text
 
-    # Collect the Ctrl+A case IPs at the same time as the form values.
-    & $caseIpRefreshAction -Text $stellarText
-    [System.Windows.Forms.Application]::DoEvents()
+    # Only refresh and query case IPs when the parser-tab checkbox is checked.
+    if ($stellarRunCaseIpLookupCheckBox.Checked) {
+        & $caseIpRefreshAction -Text $stellarText
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    else {
+        $caseIpStatusLabel.Text = "Case IP lookup skipped (unchecked on Parser tab)."
+    }
 
     # -----------------------------
     # JSON DATA
@@ -5039,17 +5054,18 @@ $stellarButton.Add_Click({
     $tabControl.SelectedTab = $formCopyTab
     $formCopyGrid.Focus()
 
-    # Automatically build the same four-provider summary used by the normal
-    # IP Lookup tab for every public address found in the submitted case.
-    if ($caseIpPublicList.Items.Count -gt 0) {
-        & $caseIpRunLookupAction
-    }
-    else {
-        $caseIpStatusLabel.Text = "No public IP addresses were found in this case."
-        $caseIpResultsBox.Text = (
-            "No public IP addresses were sent to external services.`r`n" +
-            "Private and reserved addresses remain listed above."
-        )
+    # Automatically build the same four-provider summary only when enabled.
+    if ($stellarRunCaseIpLookupCheckBox.Checked) {
+        if ($caseIpPublicList.Items.Count -gt 0) {
+            & $caseIpRunLookupAction
+        }
+        else {
+            $caseIpStatusLabel.Text = "No public IP addresses were found in this case."
+            $caseIpResultsBox.Text = (
+                "No public IP addresses were sent to external services.`r`n" +
+                "Private and reserved addresses remain listed above."
+            )
+        }
     }
 
 })

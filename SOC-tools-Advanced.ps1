@@ -1921,7 +1921,7 @@ $homeRoleComboBox.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 [void]$homeRoleComboBox.Items.Add("L1")
 [void]$homeRoleComboBox.Items.Add("L2")
 [void]$homeRoleComboBox.Items.Add("L3")
-$homeRoleComboBox.SelectedIndex = 1
+$homeRoleComboBox.SelectedIndex = 2
 $homeTab.Controls.Add($homeRoleComboBox)
 
 $homeClockInButton = New-Object System.Windows.Forms.Button
@@ -4699,7 +4699,7 @@ $stellarAutofillMode.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $stellarFillModeGroup.Controls.Add($stellarAutofillMode)
 
 $stellarTruePositiveButton = New-Object System.Windows.Forms.Button
-$stellarTruePositiveButton.Text = "True Positive"
+$stellarTruePositiveButton.Text = "True Positive Email"
 $stellarTruePositiveButton.Location = New-Object System.Drawing.Point(455, 535)
 $stellarTruePositiveButton.Size = New-Object System.Drawing.Size(180, 45)
 $stellarTab.Controls.Add($stellarTruePositiveButton)
@@ -5533,8 +5533,8 @@ $stellarButton.Add_Click({
     }
 
 
-    # Description and JSON stay out of the URL to avoid oversized links.
-    # Supporting Notes can be included by Autofill; Scripting pastes all three.
+    # JSON, Description, and Supporting Notes are scripted after Airtable loads.
+    # Keep these long text fields out of the URL to avoid oversized links.
     
     if ($stellarKillChainStage) {
         $stellarParameters += "prefill_Kill+Chain+Stage=$([System.Web.HttpUtility]::UrlEncode($stellarKillChainStage))"
@@ -5602,18 +5602,8 @@ $stellarButton.Add_Click({
 
     if ($stellarFillMode -eq 'autofill') {
         $stellarAutofillParameters = @($stellarParameters)
-        foreach ($stellarLongField in @(
-            @{ Name = 'Supporting Notes:'; Value = $stellarSupportingNotesText }
-        )) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$stellarLongField.Value)) {
-                $stellarAutofillParameters += (
-                    'prefill_' +
-                    [System.Web.HttpUtility]::UrlEncode($stellarLongField.Name) +
-                    '=' +
-                    [System.Web.HttpUtility]::UrlEncode([string]$stellarLongField.Value)
-                )
-            }
-        }
+
+
         if ($stellarAutofillParameters.Count -gt 0) {
             $stellarFinalUrl += '?' + ($stellarAutofillParameters -join '&')
         }
@@ -5728,10 +5718,10 @@ $stellarButton.Add_Click({
     if ($stellarFillMode -eq 'copy') {
         $airtableCopyValues = [ordered]@{}
         $airtableCopyValues['Tenant Name:'] = $stellarTenantName
-        for ($stellarAnalystIndex = 0; $stellarAnalystIndex -lt $stellarSelectedAnalysts.Count; $stellarAnalystIndex++) {
-            $airtableCopyValues["Analyst ($($stellarAnalystIndex + 1))"] = $stellarSelectedAnalysts[$stellarAnalystIndex]
+        if ($stellarSelectedAnalysts.Count -gt 0) {
+            $airtableCopyValues['Analyst'] = $stellarSelectedAnalysts -join ', '
         }
-        if ($stellarSelectedAnalysts.Count -eq 0) {
+        else {
             $airtableCopyValues['Analyst'] = ''
         }
         $airtableCopyValues['Stellar Severity'] = $stellarSeverity
@@ -5777,7 +5767,7 @@ $stellarButton.Add_Click({
             $airtableCopyRow.Tag = $airtableCopyValue
         }
         $airtableCopyPreview.Clear()
-        $airtableCopyStatus.Text = 'Click each row to copy its answer. Add each checked analyst separately.'
+        $airtableCopyStatus.Text = 'Click each row to copy its answer. Checked analysts are together in one row.'
     }
 
     <#
@@ -5794,19 +5784,26 @@ $stellarButton.Add_Click({
 
     Start-Process "chrome.exe" $stellarFinalUrl
 
-    # Scripting alone starts the Chrome accessibility worker; the other
-    # modes leave the browser form under the analyst's control.
-    if ($stellarFillMode -eq 'scripting' -and (
+    # Scripting fills the complete Airtable text workflow. Autofill uses the
+    # same accessibility worker for the final three sections after its URL
+    # prefills load, while leaving Tenant Name and Analyst under URL control.
+    if ($stellarFillMode -in @('scripting', 'autofill') -and (
         $stellarJsonText -or
         $stellarDescriptionText -or
         $stellarSupportingNotesText -or
-        $airtableAdditionalTextFields.Count -gt 0
+        ($stellarFillMode -eq 'scripting' -and $airtableAdditionalTextFields.Count -gt 0)
     )) {
+        $airtableWorkerAdditionalFields = if ($stellarFillMode -eq 'scripting') {
+            $airtableAdditionalTextFields
+        }
+        else {
+            @()
+        }
         $airtableFillResult = Set-AirtableJsonField `
             -JsonText $stellarJsonText `
             -DescriptionText $stellarDescriptionText `
             -SupportingNotesText $stellarSupportingNotesText `
-            -AdditionalTextFields $airtableAdditionalTextFields `
+            -AdditionalTextFields $airtableWorkerAdditionalFields `
             -TimeoutSeconds 75
 
         if ($airtableFillResult -eq 'TenantNameNotFilled') {
@@ -5842,7 +5839,7 @@ $stellarButton.Add_Click({
         [void]$mainForm.Activate()
     }
     elseif ($stellarFillMode -eq 'autofill') {
-        $stellarTenantStatusLabel.Text = 'Airtable opened with URL-prefilled fields; long values may fail to load.'
+        $stellarTenantStatusLabel.Text = 'Autofill opened Airtable; JSON, Description, and Supporting Notes are being filled by script.'
     }
 
     <# OLD OVERSIZED-JSON ALERT - DISABLED

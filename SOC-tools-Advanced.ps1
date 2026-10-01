@@ -806,10 +806,25 @@ public static class AirtableNativeWindow
                             if ($airtableFieldTarget.FastSelect) {
                                 $acceptWait = 150
                             }
+                            elseif ($airtableFieldTarget.PressEnter) {
+                                # Allow Airtable to resolve and accept the linked
+                                # tenant record before moving out of its picker.
+                                $acceptWait = 500
+                            }
                             elseif ($airtableFieldTarget.CloseAfterEnter) {
                                 $acceptWait = 170
                             }
                             Start-Sleep -Milliseconds $acceptWait
+
+                            if (
+                                [bool]$airtableFieldTarget.PressEnter -and
+                                (& $canSendAirtableKeys $airtableWindowHandle)
+                            ) {
+                                # Tab commits the selected linked record and
+                                # prevents the value remaining only in search.
+                                [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+                                Start-Sleep -Milliseconds 250
+                            }
 
                             $airtableFieldTarget.Complete = $true
 
@@ -2109,6 +2124,16 @@ $ipSites = @(
         Name = "IPinfo"
         Url  = "https://ipinfo.io/{0}"
     }
+
+    [PSCustomObject]@{
+        Name = "IP-DB"
+        Url  = "https://ip-db.com/en/ip/{0}"
+    }
+
+    [PSCustomObject]@{
+        Name = "Shodan InternetDB"
+        Url  = "https://internetdb.shodan.io/{0}"
+    }
 )
 
 # Sorts the lookup websites alphabetically by name
@@ -2121,6 +2146,7 @@ $ipSites = $ipSites | Sort-Object Name
 # Optional API keys are read from IP-Lookup-API-Keys.json first, then from
 # Windows environment variables if the matching JSON value is blank or missing:
 #   IPINFO_TOKEN, OTX_API_KEY, VIRUSTOTAL_API_KEY, ABUSEIPDB_API_KEY
+#   IPDB_API_KEY (Shodan InternetDB does not require a key)
 function Get-IpLookupApiKey {
     param(
         [Parameter(Mandatory = $true)]
@@ -2177,7 +2203,10 @@ function Invoke-IpLookupJsonRequest {
         [Parameter(Mandatory = $true)]
         [string]$Uri,
 
-        [hashtable]$Headers = @{}
+        [hashtable]$Headers = @{},
+
+        [ValidateRange(1, 60)]
+        [int]$TimeoutSeconds = 6
     )
 
     # Older Windows PowerShell installations may not enable TLS 1.2 by default.
@@ -2189,8 +2218,24 @@ function Invoke-IpLookupJsonRequest {
         -Uri $Uri `
         -Method Get `
         -Headers $Headers `
-        -TimeoutSec 6 `
+        -TimeoutSec $TimeoutSeconds `
         -ErrorAction Stop
+}
+
+function Get-IpLookupFailureReason {
+    param([System.Exception]$Exception)
+
+    if ($null -ne $Exception -and $null -ne $Exception.Response) {
+        try {
+            $statusCode = [int]$Exception.Response.StatusCode
+            if ($statusCode -gt 0) { return "HTTP $statusCode" }
+        }
+        catch { }
+    }
+    if ($null -ne $Exception -and $Exception.ToString() -match '(?i)timed?\s*out|timeout|TaskCanceledException') {
+        return 'timed out'
+    }
+    return 'network or service error'
 }
 
 # Extract one canonical IPv4 or IPv6 address from common analyst input. This
@@ -2596,6 +2641,10 @@ function Get-IpThreatLocationSummary {
     $abuseIpDbDetails = @(
         "Status: Not checked. Add ABUSEIPDB_API_KEY to the API key JSON file."
     )
+    $ipDbDetails = @(
+        "Status: Not checked. Add IPDB_API_KEY to the API key JSON file."
+    )
+    $shodanDetails = @('Status: Not checked.')
 
     # IPinfo supplies the primary location and network-owner attribution.
     try {
@@ -2927,12 +2976,12 @@ function Get-IpThreatLocationSummary {
         }
 
         $otxUri = "https://otx.alienvault.com/api/v1/indicators/$otxIndicatorType/$encodedIp/general"
-        $otx = Invoke-IpLookupJsonRequest -Uri $otxUri -Headers $otxHeaders
+        $otx = Invoke-IpLookupJsonRequest -Uri $otxUri -Headers $otxHeaders -TimeoutSeconds 20
         $otxPassiveDnsNames = @()
 
         try {
             $otxPassiveDnsUri = "https://otx.alienvault.com/api/v1/indicators/$otxIndicatorType/$encodedIp/passive_dns"
-            $otxPassiveDns = Invoke-IpLookupJsonRequest -Uri $otxPassiveDnsUri -Headers $otxHeaders
+            $otxPassiveDns = Invoke-IpLookupJsonRequest -Uri $otxPassiveDnsUri -Headers $otxHeaders -TimeoutSeconds 10
             $otxPassiveDnsNames = @(
                 @($otxPassiveDns.passive_dns) |
                     ForEach-Object {
@@ -3094,7 +3143,7 @@ function Get-IpThreatLocationSummary {
         }
     }
     catch {
-        $otxDetails = @("Status: Threat-intelligence request unavailable.")
+        $otxDetails = @("Status: Threat-intelligence request unavailable ($(Get-IpLookupFailureReason -Exception $_.Exception)).")
     }
 
     # VirusTotal is queried only when the user has configured an API key.
@@ -3503,6 +3552,169 @@ function Get-IpThreatLocationSummary {
         }
     }
 
+    # IP-DB combines blacklist, DNSBL, and report evidence in one response.
+    $ipDbApiKey = Get-IpLookupApiKey -Name "IPDB_API_KEY"
+    if (-not [string]::IsNullOrWhiteSpace($ipDbApiKey)) {
+        try {
+            $ipDbUri = "https://ip-db.com/api/v1/check/$encodedIp"
+            $ipDb = Invoke-IpLookupJsonRequest -Uri $ipDbUri -Headers @{ Key = $ipDbApiKey } -TimeoutSeconds 10
+            $providerResponses++
+            $threatSourcesChecked++
+
+            $ipDbScore = $null
+            if (Test-IpLookupValueReported -InputObject $ipDb -PropertyName 'abuseConfidenceScore') {
+                $ipDbScore = [int]$ipDb.abuseConfidenceScore
+                $threatSourcesWithAssessment++
+            }
+            $ipDbBlacklists = @(
+                @($ipDb.blacklistSources) |
+                    ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 90 } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Sort-Object -Unique |
+                    Select-Object -First 12
+            )
+            $ipDbDnsbl = @(
+                @($ipDb.dnsbl) |
+                    ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_.zone -MaximumLength 70 } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Sort-Object -Unique |
+                    Select-Object -First 8
+            )
+            if ($null -ne $ipDbScore -and $ipDbScore -ge 75) {
+                $hasHighThreatSignal = $true
+            }
+            elseif (($null -ne $ipDbScore -and $ipDbScore -ge 40) -or $ipDbBlacklists.Count -gt 0) {
+                $hasPossibleThreatSignal = $true
+            }
+            if (($null -ne $ipDbScore -and $ipDbScore -ge 40) -or $ipDbBlacklists.Count -gt 0) {
+                $socSignals += "IP-DB reports score $ipDbScore/100 and $($ipDbBlacklists.Count) displayed blacklist match(es)."
+            }
+
+            $ipDbDetails = @('Status: Reputation data received.')
+            if ($null -ne $ipDbScore) {
+                $ipDbScoreLabel = ConvertTo-IpLookupSingleLine -Value $ipDb.scoreLabel -MaximumLength 40
+                $ipDbDetails += "Threat detection: Abuse score=$ipDbScore/100; label=$ipDbScoreLabel"
+            }
+            $ipDbLocation = @(
+                [string]$ipDb.city
+                [string]$ipDb.countryName
+            ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            if ($ipDbLocation.Count -gt 0) { $ipDbDetails += "Location: $($ipDbLocation -join ', ')" }
+            if (Test-IpLookupValueReported -InputObject $ipDb -PropertyName 'asn') {
+                $ipDbDetails += "ASN: AS$($ipDb.asn)"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$ipDb.asnOrg)) {
+                $ipDbDetails += "Network owner: $($ipDb.asnOrg)"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$ipDb.isp)) {
+                $ipDbDetails += "ISP: $($ipDb.isp)"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$ipDb.networkType)) {
+                $ipDbDetails += "Network type: $($ipDb.networkType)"
+            }
+            if (Test-IpLookupValueReported -InputObject $ipDb -PropertyName 'totalReports') {
+                $ipDbDetails += "Community reports: $($ipDb.totalReports); distinct reporters: $($ipDb.distinctReporters)"
+            }
+            if ($ipDbBlacklists.Count -gt 0) {
+                $ipDbDetails += "Blacklist matches (up to 12): $($ipDbBlacklists -join ', ')"
+            }
+            if ($ipDbDnsbl.Count -gt 0) {
+                $ipDbDetails += "DNSBL listings (up to 8): $($ipDbDnsbl -join ', ')"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$ipDb.lastReportedAt)) {
+                $ipDbDetails += "Last reported: $(ConvertTo-IpLookupUtcTime -Value $ipDb.lastReportedAt)"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$ipDb.abuseContact.email)) {
+                $ipDbDetails += "Abuse contact: $($ipDb.abuseContact.email)"
+            }
+            if ([string]::IsNullOrWhiteSpace($location) -and $ipDbLocation.Count -gt 0) {
+                $location = $ipDbLocation -join ', '
+            }
+            if ([string]::IsNullOrWhiteSpace($network) -and -not [string]::IsNullOrWhiteSpace([string]$ipDb.asnOrg)) {
+                $network = [string]$ipDb.asnOrg
+            }
+        }
+        catch {
+            $ipDbDetails = @("Status: Request unavailable ($(Get-IpLookupFailureReason -Exception $_.Exception)).")
+        }
+    }
+
+    # Shodan InternetDB enriches an IP with recently observed exposed services.
+    # This public endpoint does not require an API key.
+    try {
+        $shodanUri = "https://internetdb.shodan.io/$encodedIp"
+        $shodan = Invoke-IpLookupJsonRequest -Uri $shodanUri -TimeoutSeconds 10
+        $providerResponses++
+
+        $shodanPorts = @(
+            @($shodan.ports) |
+                ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 30
+        )
+        $shodanVulnerabilities = @(
+            @($shodan.vulns) |
+                ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 40 } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 20
+        )
+        $shodanHostnames = @(
+            @($shodan.hostnames) |
+                ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 100 } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 10
+        )
+        $shodanCpes = @(
+            @($shodan.cpes) |
+                ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 100 } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 10
+        )
+        $shodanTags = @(
+            @($shodan.tags) |
+                ForEach-Object { ConvertTo-IpLookupSingleLine -Value $_ -MaximumLength 60 } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                Select-Object -First 12
+        )
+
+        $shodanDetails = @('Status: InternetDB data received (dataset refreshes weekly).')
+        if ($shodanPorts.Count -gt 0) {
+            $shodanDetails += "Open ports (up to 30): $($shodanPorts -join ', ')"
+        }
+        if ($shodanHostnames.Count -gt 0) {
+            $shodanDetails += "Hostnames (up to 10): $($shodanHostnames -join ', ')"
+        }
+        if ($shodanCpes.Count -gt 0) {
+            $shodanDetails += "CPEs / detected products (up to 10): $($shodanCpes -join ', ')"
+        }
+        if ($shodanTags.Count -gt 0) {
+            $shodanDetails += "Tags (up to 12): $($shodanTags -join ', ')"
+        }
+        if ($shodanVulnerabilities.Count -gt 0) {
+            $shodanDetails += "Potential vulnerabilities (up to 20): $($shodanVulnerabilities -join ', ')"
+        }
+        if ($shodanPorts.Count -gt 0 -or $shodanVulnerabilities.Count -gt 0) {
+            $socSignals += "Shodan InternetDB lists $($shodanPorts.Count) port(s) and $($shodanVulnerabilities.Count) potential CVE(s); verify current exposure and applicability."
+        }
+    }
+    catch {
+        $shodanError = $_.Exception
+        $shodanStatusCode = $null
+        try { $shodanStatusCode = [int]$shodanError.Response.StatusCode } catch { }
+        if ($shodanStatusCode -eq 404) {
+            $providerResponses++
+            $shodanDetails = @('Status: No Shodan InternetDB record found (HTTP 404).')
+        }
+        else {
+            $shodanDetails = @("Status: Request unavailable ($(Get-IpLookupFailureReason -Exception $shodanError)).")
+        }
+    }
+
     if ($hasHighThreatSignal) {
         $overall = "HIGH-RISK SIGNALS"
     }
@@ -3528,7 +3740,7 @@ function Get-IpThreatLocationSummary {
         }
     }
 
-    # Tab 4 uses the compact SOC view. Each provider remains separate, but
+    # Case IP Lookups uses the compact SOC view. Each provider remains separate, but
     # secondary enrichment fields are removed so the analyst can scan the
     # location, ownership, domain, and threat findings quickly.
     if ($ImportantOnly) {
@@ -3560,8 +3772,8 @@ function Get-IpThreatLocationSummary {
     $summaryLines = @(
         "IP: $IpAddress"
         "OVERALL: $overall"
-        "Providers responding: $providerResponses of 4"
-        "Threat feeds checked: $threatSourcesChecked of 3"
+        "Providers responding: $providerResponses of 6"
+        "Threat feeds checked: $threatSourcesChecked of 4"
         ""
         "QUICK SOC FLAGS / CONTEXT"
         $socSignals
@@ -3600,6 +3812,12 @@ function Get-IpThreatLocationSummary {
         ""
         "4. ABUSEIPDB"
         $abuseIpDbDetails
+        ""
+        "5. IP-DB"
+        $ipDbDetails
+        ""
+        "6. SHODAN INTERNETDB"
+        $shodanDetails
         ""
         "Analyst note: Reputation is point-in-time context. Corroborate it with the alert, logs, asset role, direction of traffic, and observed behavior."
     )
@@ -3747,13 +3965,20 @@ $ipCloseTabsTip.Size = New-Object System.Drawing.Size(455,36)
 $ipCloseTabsTip.Location = New-Object System.Drawing.Point(20,514)
 $ipCloseTabsTip.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
 
-# Explains which services contribute to the automatic summary
+# Lists the main and supplemental summary sources side by side.
 $ipSummarySourcesTip = New-Object System.Windows.Forms.Label
-$ipSummarySourcesTip.Text = "The four websites that work with the summary are:`n1. IPinfo`n2. LevelBlue OTX`n3. VirusTotal`n4. AbuseIPDB"
+$ipSummarySourcesTip.Text = "TAB 2 - MAIN SOURCES:`n1. IPinfo`n2. LevelBlue OTX`n3. VirusTotal`n4. AbuseIPDB"
 $ipSummarySourcesTip.AutoSize = $false
-$ipSummarySourcesTip.Size = New-Object System.Drawing.Size(455,82)
+$ipSummarySourcesTip.Size = New-Object System.Drawing.Size(215,82)
 $ipSummarySourcesTip.Location = New-Object System.Drawing.Point(20,552)
 $ipSummarySourcesTip.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
+
+$ipSummarySupplementalTip = New-Object System.Windows.Forms.Label
+$ipSummarySupplementalTip.Text = "SUPPLEMENTAL SOURCES:`n1. IP-DB`n2. Shodan InternetDB`nOutside the main source set; queried in Tabs 2 and 5."
+$ipSummarySupplementalTip.AutoSize = $false
+$ipSummarySupplementalTip.Size = New-Object System.Drawing.Size(230,88)
+$ipSummarySupplementalTip.Location = New-Object System.Drawing.Point(250,548)
+$ipSummarySupplementalTip.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
 
 
 # ------------------------------------------------------------
@@ -3936,6 +4161,7 @@ $ipPrivateLabel.ForeColor = [System.Drawing.Color]::FromArgb(190,90,35)
 # Makes the Chrome tab-cleanup instruction readable without overpowering the form
 $ipCloseTabsTip.ForeColor = [System.Drawing.Color]::FromArgb(75,85,95)
 $ipSummarySourcesTip.ForeColor = [System.Drawing.Color]::FromArgb(75,85,95)
+$ipSummarySupplementalTip.ForeColor = [System.Drawing.Color]::FromArgb(75,85,95)
 
 # Threat/location results styling
 $ipSummaryLabel.ForeColor = [System.Drawing.Color]::FromArgb(35,95,160)
@@ -4174,6 +4400,7 @@ $ipTab.Controls.Add($ipCloseTabsTip)
 
 # Adds the automatic-summary source explanation
 $ipTab.Controls.Add($ipSummarySourcesTip)
+$ipTab.Controls.Add($ipSummarySupplementalTip)
 
 
 # ------------------------------------------------------------
@@ -4353,7 +4580,7 @@ $caseIpResultsBox.BackColor = [System.Drawing.Color]::White
 $caseIpResultsBox.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
 $caseIpResultsBox.BorderStyle = "FixedSingle"
 $caseIpResultsBox.Font = New-Object System.Drawing.Font("Consolas", 10)
-$caseIpResultsBox.Text = "Public-IP results from IPinfo, LevelBlue OTX, VirusTotal, and AbuseIPDB will appear here."
+$caseIpResultsBox.Text = "Tab 5 - Case IP Lookups checks the main sources (IPinfo, LevelBlue OTX, VirusTotal, AbuseIPDB) and supplemental sources (IP-DB and Shodan InternetDB, outside the four main sources). The supplemental sources are also queried in Tab 2 - IP Lookup."
 $caseIpTab.Controls.Add($caseIpResultsBox)
 
 $caseIpAddressByDisplay = @{}
@@ -4433,7 +4660,7 @@ $caseIpRefreshAction = {
     $caseIpPublicLabel.Text = "Public ($($caseIpPublicList.Items.Count))"
     $caseIpRunButton.Enabled = ($caseIpPublicList.Items.Count -gt 0)
     $caseIpCopyButton.Enabled = $false
-    $caseIpResultsBox.Text = "Public-IP results from IPinfo, LevelBlue OTX, VirusTotal, and AbuseIPDB will appear here."
+    $caseIpResultsBox.Text = "Tab 5 - Case IP Lookups checks the main sources (IPinfo, LevelBlue OTX, VirusTotal, AbuseIPDB) and supplemental sources (IP-DB and Shodan InternetDB, outside the four main sources). The supplemental sources are also queried in Tab 2 - IP Lookup."
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         $caseIpStatusLabel.Text = "No case text or JSON has been pasted yet."
@@ -4625,6 +4852,42 @@ foreach ($stellarAnalyst in $stellarAnalysts) {
 # FILL AIRTABLE BUTTON
 # ==========================================
 
+function Open-SocTruePositiveDraft {
+    param(
+        [Parameter(Mandatory = $true)][string]$Subject,
+        [Parameter(Mandatory = $true)][string]$Body
+    )
+
+    try {
+        $outlook = New-Object -ComObject Outlook.Application -ErrorAction Stop
+    }
+    catch {
+        throw 'Classic Outlook is required for automatic sender selection and complete JSON. Open classic Outlook and add the Cyber Defense Center account, then try again.'
+    }
+
+    $senderAccount = $null
+    foreach ($account in $outlook.Session.Accounts) {
+        $accountAddress = ([string]$account.SmtpAddress).Trim()
+        if ($accountAddress -imatch '^[^@\s]+@uscyberdefensecenter\.org$') {
+            $senderAccount = $account
+            break
+        }
+    }
+    if ($null -eq $senderAccount) {
+        throw 'No account ending in @uscyberdefensecenter.org is signed in to classic Outlook. Add that account in Outlook, then try again.'
+    }
+
+    # Create in the selected account's Drafts folder instead of the default mailbox.
+    $draftsFolder = $senderAccount.DeliveryStore.GetDefaultFolder(16)
+    $draft = $draftsFolder.Items.Add('IPM.Note')
+    $draft.SendUsingAccount = $senderAccount
+    $draft.Subject = $Subject
+    $draft.Body = $Body
+    $draft.Save()
+    $draft.Display($false)
+}
+
+
 function Get-StellarIssueForEmail {
     param([string]$CaseText, [string]$JsonText)
 
@@ -4678,7 +4941,7 @@ $stellarFillModeGroup.ForeColor = [System.Drawing.Color]::White
 $stellarTab.Controls.Add($stellarFillModeGroup)
 
 $stellarScriptingMode = New-Object System.Windows.Forms.RadioButton
-$stellarScriptingMode.Text = "Scripting (new)"
+$stellarScriptingMode.Text = "Scripting (preferred)"
 $stellarScriptingMode.Location = New-Object System.Drawing.Point(9, 17)
 $stellarScriptingMode.Size = New-Object System.Drawing.Size(210, 22)
 $stellarScriptingMode.Checked = $true
@@ -4977,32 +5240,9 @@ $stellarTruePositiveButton.Add_Click({
     }
 
     try {
-        # Windows opens the user's default mailto handler, including New
-        # Outlook when it is configured as the default mail application.
-        # mailto bodies are plain text, so use ordinary ASCII characters here.
         $emailDescriptionPlaceholder = 'Paste the rest of the description here'
-        $mailtoBody = "Tenant Name: $emailTenantName`r`n$caseUrl`r`n`r`n$caseDescription`r`n`r`n$emailDescriptionPlaceholder`r`n`r`nRecommendation:`r`n`r`nEvent JSON:`r`n$formattedJson"
-        $mailtoUrl = 'mailto:?subject=' +
-            [uri]::EscapeDataString($emailSubject) +
-            '&body=' + [uri]::EscapeDataString($mailtoBody)
-
-        $jsonNeedsManualPaste = $mailtoUrl.Length -gt 1800
-        if ($jsonNeedsManualPaste) {
-            [System.Windows.Forms.Clipboard]::SetText($formattedJson)
-            $mailtoBody = "Tenant Name: $emailTenantName`r`n$caseUrl`r`n`r`n$caseDescription`r`n`r`n$emailDescriptionPlaceholder`r`n`r`nRecommendation:`r`n`r`nEvent JSON: [paste from clipboard]"
-            $mailtoUrl = 'mailto:?subject=' +
-                [uri]::EscapeDataString($emailSubject) +
-                '&body=' + [uri]::EscapeDataString($mailtoBody)
-        }
-
-        Start-Process $mailtoUrl
-
-        if ($jsonNeedsManualPaste) {
-            [void][System.Windows.Forms.MessageBox]::Show(
-                "A new email opened with the issue, tenant name, case link, description, and Recommendation line. The complete JSON is on your clipboard; paste it under Event JSON. Nothing was sent.",
-                "True Positive Draft"
-            )
-        }
+        $emailBody = "Tenant Name: $emailTenantName`r`n$caseUrl`r`n`r`n$caseDescription`r`n`r`n$emailDescriptionPlaceholder`r`n`r`nRecommendation:`r`n`r`nEvent JSON:`r`n$formattedJson"
+        Open-SocTruePositiveDraft -Subject $emailSubject -Body $emailBody
     }
     catch {
         [void][System.Windows.Forms.MessageBox]::Show(
@@ -5312,6 +5552,10 @@ $stellarButton.Add_Click({
     # Stellar may use "SSOC: city" while Airtable uses "SSOC-city".
     if ($stellarTenantName -match '(?i)^SSOC\s*[:\-]\s*(.+)$') {
         $stellarTenantName = "SSOC-$($matches[1].Trim())"
+    }
+    # Correct this known alias before searching Airtable's linked Tenant field.
+    if ($stellarTenantName -match '(?i)^SSOC-H-CEI$') {
+        $stellarTenantName = 'SSOC-CEI'
     }
 
     if ([string]::IsNullOrWhiteSpace($stellarTenantName)) {
@@ -5820,7 +6064,7 @@ $stellarButton.Add_Click({
         }
     }
 
-    # Automatically build the same four-provider summary only when enabled.
+    # Automatically build the same six-provider summary only when enabled.
     if ($stellarRunCaseIpLookupCheckBox.Checked) {
         if ($caseIpPublicList.Items.Count -gt 0) {
             & $caseIpRunLookupAction

@@ -2382,65 +2382,82 @@ function Get-IpAddressSourceLabel {
     return "Alert text"
 }
 
-# Find every unique literal IPv4 and IPv6 address in copied Stellar text. Each
-# result includes its source field(s), parsed value, and public/private status.
+# Extract confirmed addresses and keep ambiguous IPv6-like tokens separate.
+# Potential fragments are preserved exactly; never invent missing IPv6 groups.
 function Get-IpAddressesFromText {
-    param(
-        [string]$Text
-    )
+    param([string]$Text)
 
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return @()
-    }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
 
     $candidateMatches = @()
-
-    # Broad IPv4 candidates are validated by IPAddress.TryParse below.
-    foreach ($match in [regex]::Matches(
+    $colonMatches = @([regex]::Matches(
         $Text,
-        '(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'
+        '(?i)(?<![a-z0-9_.:%])[0-9a-f:.%]*:[0-9a-f:.%]*(?![a-z0-9_.:%])'
+    ))
+
+    foreach ($match in [regex]::Matches(
+        $Text, '(?i)(?<![a-z0-9_.])(?:\d{1,3}\.){3}\d{1,3}(?![a-z0-9_]|\.[a-z0-9_.])'
     )) {
-        $candidateMatches += [PSCustomObject]@{
-            Index = $match.Index
-            Value = $match.Value
+        # Do not extract an embedded IPv4 address as a second, unrelated IP.
+        $insideIpv6 = $false
+        foreach ($colonMatch in $colonMatches) {
+            if (@($colonMatch.Value.ToCharArray() | Where-Object { $_ -eq ':' }).Count -ge 2 -and
+                $match.Index -ge $colonMatch.Index -and
+                ($match.Index + $match.Length) -le ($colonMatch.Index + $colonMatch.Length)) {
+                $insideIpv6 = $true
+                break
+            }
+        }
+        if (-not $insideIpv6) {
+            $candidateMatches += [PSCustomObject]@{ Index = $match.Index; Value = $match.Value; ColonToken = $false }
         }
     }
 
-    # Collect colon-containing tokens, then let IPAddress.TryParse distinguish
-    # IPv6 from timestamps, MAC addresses, and ordinary text.
-    foreach ($match in [regex]::Matches(
-        $Text,
-        '(?i)(?<![0-9a-f:.%])[0-9a-f:.%]*:[0-9a-f:.%]+(?![0-9a-f:.%])'
-    )) {
-        $candidateMatches += [PSCustomObject]@{
-            Index = $match.Index
-            Value = $match.Value
+    foreach ($match in $colonMatches) {
+        $token = $match.Value
+        if ($token -notmatch '[0-9a-fA-F]') { continue }
+        # Exclude JSON property separators, drive letters, clock times, MACs,
+        # and IPv4 host:port suffixes from the potential-address column.
+        if ($token.StartsWith(':') -and $match.Index -gt 0) {
+            $previousCharacter = $Text[$match.Index - 1]
+            if ($previousCharacter -eq ']') { continue }
+            if ($previousCharacter -eq '"' -and $match.Index -gt 1 -and
+                [string]$Text[$match.Index - 2] -match '[a-zA-Z0-9_.-]') { continue }
         }
+        $afterIndex = $match.Index + $match.Length
+        if ($token -match '^[a-fA-F]:$' -and $afterIndex -lt $Text.Length -and
+            ($Text[$afterIndex] -eq '\' -or $Text[$afterIndex] -eq '/')) { continue }
+        if ($token -match '^\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$') { continue }
+        if ($token -match '^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$') { continue }
+        if ($token -match '^\d{1,3}(?:\.\d{1,3}){3}:\d+$') { continue }
+        $candidateMatches += [PSCustomObject]@{ Index = $match.Index; Value = $token; ColonToken = $true }
     }
 
-    # Use native PowerShell collections here for full Windows PowerShell 5.1
-    # compatibility. Generic HashSet constructor behavior differs between the
-    # .NET Framework and newer PowerShell/.NET versions.
     $recordsByAddress = @{}
     $orderedAddressKeys = @()
-
     foreach ($candidateMatch in @($candidateMatches | Sort-Object Index)) {
-        $normalizedAddress = ConvertTo-NormalizedIpAddress `
-            -InputText $candidateMatch.Value
+        $normalizedAddress = ConvertTo-NormalizedIpAddress -InputText $candidateMatch.Value
+        $parsedAddress = $null
+        $isPublicAddress = $false
+        $isPotential = [string]::IsNullOrWhiteSpace($normalizedAddress)
+        if ($isPotential -and -not $candidateMatch.ColonToken) { continue }
 
-        $addressKey = [string]$normalizedAddress
-        if (-not [string]::IsNullOrWhiteSpace($addressKey)) {
-            $addressKey = $addressKey.ToLowerInvariant()
+        if (-not $isPotential) {
+            [void][System.Net.IPAddress]::TryParse($normalizedAddress, [ref]$parsedAddress)
+            $isPublicAddress = Test-IpAddressIsPublic -Address $parsedAddress
+            # Very short compressed public values (e.g. ::a, e::) can be
+            # fragments in alert text. Require the separate potential action.
+            if ($parsedAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6 -and
+                $isPublicAddress) {
+                $explicitGroups = @(($candidateMatch.Value -split ':') | Where-Object { $_ -ne '' })
+                if ($explicitGroups.Count -lt 2) { $isPotential = $true }
+            }
         }
 
-        if ([string]::IsNullOrWhiteSpace($normalizedAddress)) {
-            continue
-        }
-
-        $sourceLabel = Get-IpAddressSourceLabel `
-            -Text $Text `
-            -MatchIndex $candidateMatch.Index
-
+        $addressValue = $normalizedAddress
+        if ($isPotential) { $addressValue = $candidateMatch.Value }
+        $addressKey = ('{0}:{1}' -f $isPotential, $addressValue).ToLowerInvariant()
+        $sourceLabel = Get-IpAddressSourceLabel -Text $Text -MatchIndex $candidateMatch.Index
         if ($recordsByAddress.ContainsKey($addressKey)) {
             $existingRecord = $recordsByAddress[$addressKey]
             if ($existingRecord.SourceLabels -notcontains $sourceLabel) {
@@ -2448,43 +2465,29 @@ function Get-IpAddressesFromText {
             }
             continue
         }
-
-        $parsedAddress = $null
-        if (-not [System.Net.IPAddress]::TryParse(
-            $normalizedAddress,
-            [ref]$parsedAddress
-        )) {
-            continue
-        }
-
-        $isPublicAddress = Test-IpAddressIsPublic -Address $parsedAddress
-
         $recordsByAddress[$addressKey] = [PSCustomObject]@{
-            Address       = $normalizedAddress
+            Address = $addressValue
             ParsedAddress = $parsedAddress
-            IsPublic      = [bool]$isPublicAddress
-            SourceLabels  = @($sourceLabel)
+            IsPublic = [bool]$isPublicAddress
+            IsPotential = [bool]$isPotential
+            SourceLabels = @($sourceLabel)
         }
         $orderedAddressKeys += $addressKey
     }
 
-    $results = @(
-        foreach ($addressKey in $orderedAddressKeys) {
-            $record = $recordsByAddress[$addressKey]
-            $sourceDisplay = @($record.SourceLabels) -join ", "
-
-            [PSCustomObject]@{
-                Address       = $record.Address
-                ParsedAddress = $record.ParsedAddress
-                IsPublic      = $record.IsPublic
-                SourceLabels  = @($record.SourceLabels)
-                Source        = $sourceDisplay
-                Display       = "$($record.Address)  [$sourceDisplay]"
-            }
+    foreach ($addressKey in $orderedAddressKeys) {
+        $record = $recordsByAddress[$addressKey]
+        $sourceDisplay = @($record.SourceLabels) -join ', '
+        [PSCustomObject]@{
+            Address = $record.Address
+            ParsedAddress = $record.ParsedAddress
+            IsPublic = $record.IsPublic
+            IsPotential = $record.IsPotential
+            SourceLabels = @($record.SourceLabels)
+            Source = $sourceDisplay
+            Display = "$($record.Address)  [$sourceDisplay]"
         }
-    )
-
-    return $results
+    }
 }
 
 function Get-IpLookupCountryName {
@@ -4482,7 +4485,7 @@ $stellarTab.Controls.Add($stellarTextBox)
 $caseIpInstructions = New-Object System.Windows.Forms.Label
 $caseIpInstructions.Text = "Paste complete JSON:"
 $caseIpInstructions.AutoSize = $false
-$caseIpInstructions.Size = New-Object System.Drawing.Size(300, 24)
+$caseIpInstructions.Size = New-Object System.Drawing.Size(280, 24)
 $caseIpInstructions.Location = New-Object System.Drawing.Point(20, 20)
 $caseIpInstructions.ForeColor = [System.Drawing.Color]::FromArgb(35, 45, 55)
 $caseIpTab.Controls.Add($caseIpInstructions)
@@ -4510,6 +4513,17 @@ $caseIpCheckJsonButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
 $caseIpCheckJsonButton.ForeColor = [System.Drawing.Color]::White
 $caseIpTab.Controls.Add($caseIpCheckJsonButton)
 
+$caseIpPotentialRunButton = New-Object System.Windows.Forms.Button
+$caseIpPotentialRunButton.Text = "Run Potential IPs"
+$caseIpPotentialRunButton.Size = New-Object System.Drawing.Size(120, 24)
+$caseIpPotentialRunButton.Location = New-Object System.Drawing.Point(410, 18)
+$caseIpPotentialRunButton.FlatStyle = "Flat"
+$caseIpPotentialRunButton.FlatAppearance.BorderSize = 0
+$caseIpPotentialRunButton.BackColor = [System.Drawing.Color]::FromArgb(150, 100, 25)
+$caseIpPotentialRunButton.ForeColor = [System.Drawing.Color]::White
+$caseIpPotentialRunButton.Enabled = $false
+$caseIpTab.Controls.Add($caseIpPotentialRunButton)
+
 $caseIpPrivateLabel = New-Object System.Windows.Forms.Label
 $caseIpPrivateLabel.Text = "Private / Reserved (0)"
 $caseIpPrivateLabel.AutoSize = $true
@@ -4520,21 +4534,36 @@ $caseIpTab.Controls.Add($caseIpPrivateLabel)
 $caseIpPublicLabel = New-Object System.Windows.Forms.Label
 $caseIpPublicLabel.Text = "Public (0)"
 $caseIpPublicLabel.AutoSize = $true
-$caseIpPublicLabel.Location = New-Object System.Drawing.Point(365, 178)
+$caseIpPublicLabel.Location = New-Object System.Drawing.Point(410, 178)
 $caseIpPublicLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 95, 160)
 $caseIpTab.Controls.Add($caseIpPublicLabel)
 
 $caseIpPrivateList = New-Object System.Windows.Forms.ListBox
-$caseIpPrivateList.Size = New-Object System.Drawing.Size(315, 120)
+$caseIpPrivateList.Size = New-Object System.Drawing.Size(210, 120)
 $caseIpPrivateList.Location = New-Object System.Drawing.Point(20, 200)
 $caseIpPrivateList.HorizontalScrollbar = $true
 $caseIpPrivateList.BackColor = [System.Drawing.Color]::White
 $caseIpPrivateList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
 $caseIpTab.Controls.Add($caseIpPrivateList)
 
+$caseIpPotentialLabel = New-Object System.Windows.Forms.Label
+$caseIpPotentialLabel.Text = "Potential IP Addresses (0)"
+$caseIpPotentialLabel.AutoSize = $true
+$caseIpPotentialLabel.Location = New-Object System.Drawing.Point(245, 178)
+$caseIpPotentialLabel.ForeColor = [System.Drawing.Color]::FromArgb(150, 100, 25)
+$caseIpTab.Controls.Add($caseIpPotentialLabel)
+
+$caseIpPotentialList = New-Object System.Windows.Forms.ListBox
+$caseIpPotentialList.Size = New-Object System.Drawing.Size(150, 120)
+$caseIpPotentialList.Location = New-Object System.Drawing.Point(245, 200)
+$caseIpPotentialList.HorizontalScrollbar = $true
+$caseIpPotentialList.BackColor = [System.Drawing.Color]::White
+$caseIpPotentialList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+$caseIpTab.Controls.Add($caseIpPotentialList)
+
 $caseIpPublicList = New-Object System.Windows.Forms.ListBox
-$caseIpPublicList.Size = New-Object System.Drawing.Size(315, 120)
-$caseIpPublicList.Location = New-Object System.Drawing.Point(365, 200)
+$caseIpPublicList.Size = New-Object System.Drawing.Size(270, 120)
+$caseIpPublicList.Location = New-Object System.Drawing.Point(410, 200)
 $caseIpPublicList.HorizontalScrollbar = $true
 $caseIpPublicList.BackColor = [System.Drawing.Color]::White
 $caseIpPublicList.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
@@ -4585,7 +4614,7 @@ $caseIpTab.Controls.Add($caseIpResultsBox)
 
 $caseIpAddressByDisplay = @{}
 
-# Clicking either list copies the exact IPv4 or IPv6 address that was clicked.
+# Clicking a list copies the address or potential fragment that was clicked.
 $caseIpPrivateList.Add_MouseClick({
     param($listControl, $mouseClickEvent)
 
@@ -4626,24 +4655,42 @@ $caseIpPublicList.Add_MouseClick({
     }
 })
 
-# Rebuild the two lists only when Fill Airtable is pressed. Exact duplicate
-# addresses are removed, and private/reserved values are never sent to an API.
+$caseIpPotentialList.Add_MouseClick({
+    param($listControl, $mouseClickEvent)
+    $clickedIndex = $listControl.IndexFromPoint($mouseClickEvent.Location)
+    if ($clickedIndex -ge 0) {
+        $clickedDisplay = [string]$listControl.Items[$clickedIndex]
+        $clickedAddress = [string]$caseIpAddressByDisplay[$clickedDisplay]
+        if (-not [string]::IsNullOrWhiteSpace($clickedAddress)) {
+            [System.Windows.Forms.Clipboard]::SetText($clickedAddress)
+            $caseIpStatusLabel.Text = "Copied potential IP: $clickedAddress"
+        }
+    }
+})
+
+# Rebuild all three lists for Check JSON or Fill Airtable. Potential values
+# are excluded from automatic lookups; private/reserved IPs stay local.
 $caseIpRefreshAction = {
     param([string]$Text)
 
     $caseIpPrivateList.BeginUpdate()
     $caseIpPublicList.BeginUpdate()
+    $caseIpPotentialList.BeginUpdate()
 
     try {
         $caseIpPrivateList.Items.Clear()
         $caseIpPublicList.Items.Clear()
+        $caseIpPotentialList.Items.Clear()
         $caseIpAddressByDisplay.Clear()
 
         foreach ($caseIpRecord in @(Get-IpAddressesFromText -Text $Text)) {
             $caseIpDisplay = [string]$caseIpRecord.Display
             $caseIpAddressByDisplay[$caseIpDisplay] = [string]$caseIpRecord.Address
 
-            if ($caseIpRecord.IsPublic) {
+            if ($caseIpRecord.IsPotential) {
+                [void]$caseIpPotentialList.Items.Add($caseIpDisplay)
+            }
+            elseif ($caseIpRecord.IsPublic) {
                 [void]$caseIpPublicList.Items.Add($caseIpDisplay)
             }
             else {
@@ -4654,10 +4701,13 @@ $caseIpRefreshAction = {
     finally {
         $caseIpPrivateList.EndUpdate()
         $caseIpPublicList.EndUpdate()
+        $caseIpPotentialList.EndUpdate()
     }
 
     $caseIpPrivateLabel.Text = "Private / Reserved ($($caseIpPrivateList.Items.Count))"
     $caseIpPublicLabel.Text = "Public ($($caseIpPublicList.Items.Count))"
+    $caseIpPotentialLabel.Text = "Potential IP Addresses ($($caseIpPotentialList.Items.Count))"
+    $caseIpPotentialRunButton.Enabled = ($caseIpPotentialList.Items.Count -gt 0)
     $caseIpRunButton.Enabled = ($caseIpPublicList.Items.Count -gt 0)
     $caseIpCopyButton.Enabled = $false
     $caseIpResultsBox.Text = "Tab 5 - Case IP Lookups checks the main sources (IPinfo, LevelBlue OTX, VirusTotal, AbuseIPDB) and supplemental sources (IP-DB and Shodan InternetDB, outside the four main sources). The supplemental sources are also queried in Tab 2 - IP Lookup."
@@ -4667,17 +4717,24 @@ $caseIpRefreshAction = {
     }
     else {
         $caseIpTotalCount = $caseIpPrivateList.Items.Count + $caseIpPublicList.Items.Count
-        $caseIpStatusLabel.Text = "$caseIpTotalCount unique IP address(es) found."
+        $caseIpStatusLabel.Text = "$caseIpTotalCount confirmed IP(s); $($caseIpPotentialList.Items.Count) potential."
     }
 }
 
 $caseIpRunLookupAction = {
-    if ($caseIpPublicList.Items.Count -eq 0) {
+    param([switch]$IncludePotential)
+
+    $caseIpLookupItems = @($caseIpPublicList.Items)
+    if ($IncludePotential) { $caseIpLookupItems = @($caseIpPotentialList.Items) }
+    if ($caseIpLookupItems.Count -eq 0) {
         return
     }
 
     # Always discard manual changes and rebuild the report from the APIs.
     $caseIpResultsBox.Clear()
+    $caseIpCheckJsonButton.Enabled = $false
+    $caseIpPotentialRunButton.Enabled = $false
+    $caseIpJsonInputBox.Enabled = $false
     $caseIpRunButton.Enabled = $false
     $caseIpCopyButton.Enabled = $false
     $mainForm.UseWaitCursor = $true
@@ -4685,9 +4742,11 @@ $caseIpRunLookupAction = {
 
     try {
         $caseIpLookupNumber = 0
-        $caseIpLookupTotal = $caseIpPublicList.Items.Count
+        $caseIpLookupTotal = $caseIpLookupItems.Count
+        $caseIpQueriedCount = 0
+        $caseIpSkippedCount = 0
 
-        foreach ($caseIpListItem in $caseIpPublicList.Items) {
+        foreach ($caseIpListItem in $caseIpLookupItems) {
             $caseIpLookupNumber++
             $caseIpDisplay = [string]$caseIpListItem
             $caseIpAddress = [string]$caseIpAddressByDisplay[$caseIpDisplay]
@@ -4700,22 +4759,28 @@ $caseIpRunLookupAction = {
             $caseIpStatusLabel.Text = "Looking up $caseIpLookupNumber of $caseIpLookupTotal`: $caseIpAddress"
             [System.Windows.Forms.Application]::DoEvents()
 
+            $caseIpNormalizedAddress = ConvertTo-NormalizedIpAddress -InputText $caseIpAddress
             $caseIpParsedAddress = $null
-            if (-not [System.Net.IPAddress]::TryParse(
-                $caseIpAddress,
-                [ref]$caseIpParsedAddress
-            )) {
-                continue
+            if ([string]::IsNullOrWhiteSpace($caseIpNormalizedAddress) -or
+                -not [System.Net.IPAddress]::TryParse($caseIpNormalizedAddress, [ref]$caseIpParsedAddress)) {
+                $caseIpSkippedCount++
+                $caseIpSummary = "Potential IP: $caseIpAddress`r`nSKIPPED: Incomplete or invalid IP address. Supply the complete address and select Check JSON."
             }
-
-            try {
-                $caseIpSummary = Get-IpThreatLocationSummary `
-                    -IpAddress $caseIpAddress `
-                    -ParsedAddress $caseIpParsedAddress `
-                    -ImportantOnly
+            elseif (-not (Test-IpAddressIsPublic -Address $caseIpParsedAddress)) {
+                $caseIpSkippedCount++
+                $caseIpSummary = "IP: $caseIpAddress`r`nSKIPPED: Private or reserved address; no external lookup."
             }
-            catch {
-                $caseIpSummary = "IP: $caseIpAddress`r`nOVERALL: SUMMARY UNAVAILABLE"
+            else {
+                $caseIpQueriedCount++
+                try {
+                    $caseIpSummary = Get-IpThreatLocationSummary `
+                        -IpAddress $caseIpNormalizedAddress `
+                        -ParsedAddress $caseIpParsedAddress `
+                        -ImportantOnly
+                }
+                catch {
+                    $caseIpSummary = "IP: $caseIpAddress`r`nOVERALL: SUMMARY UNAVAILABLE"
+                }
             }
 
             [void]$caseIpResultSections.Add($caseIpSummary)
@@ -4730,16 +4795,28 @@ $caseIpRunLookupAction = {
         $caseIpResultsBox.SelectionStart = 0
         $caseIpResultsBox.ScrollToCaret()
         $caseIpCopyButton.Enabled = ($caseIpResultSections.Count -gt 0)
-        $caseIpStatusLabel.Text = "Finished $($caseIpResultSections.Count) public IP lookup(s)."
+        if ($IncludePotential) {
+            $caseIpStatusLabel.Text = "Potential: $caseIpQueriedCount lookup(s), $caseIpSkippedCount skipped."
+        }
+        else {
+            $caseIpStatusLabel.Text = "$caseIpQueriedCount lookup(s); $($caseIpPotentialList.Items.Count) potential held."
+        }
     }
     finally {
         $mainForm.UseWaitCursor = $false
+        $caseIpCheckJsonButton.Enabled = $true
+        $caseIpJsonInputBox.Enabled = $true
+        $caseIpPotentialRunButton.Enabled = ($caseIpPotentialList.Items.Count -gt 0)
         $caseIpRunButton.Enabled = ($caseIpPublicList.Items.Count -gt 0)
     }
 }
 
 $caseIpRunButton.Add_Click({
     & $caseIpRunLookupAction
+})
+
+$caseIpPotentialRunButton.Add_Click({
+    & $caseIpRunLookupAction -IncludePotential
 })
 
 $caseIpCheckJsonButton.Add_Click({
@@ -4756,7 +4833,8 @@ $caseIpCheckJsonButton.Add_Click({
         $caseIpStatusLabel.Text = "No public IP addresses were found in the pasted JSON."
         $caseIpResultsBox.Text = (
             "No public IP addresses were sent to external services.`r`n" +
-            "Private and reserved addresses remain listed above."
+            "Private and reserved addresses remain listed above.`r`n" +
+            "Potential IPs are held for the Run Potential IPs button."
         )
     }
 })
@@ -6073,7 +6151,8 @@ $stellarButton.Add_Click({
             $caseIpStatusLabel.Text = "No public IP addresses were found in this case."
             $caseIpResultsBox.Text = (
                 "No public IP addresses were sent to external services.`r`n" +
-                "Private and reserved addresses remain listed above."
+                "Private and reserved addresses remain listed above.`r`n" +
+                "Potential IPs are held for the Run Potential IPs button."
             )
         }
     }

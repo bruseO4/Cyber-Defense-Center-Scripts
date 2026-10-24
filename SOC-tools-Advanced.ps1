@@ -1,4 +1,4 @@
-# SOC Tools - Combined PowerShell GUI
+﻿# SOC Tools - Combined PowerShell GUI
 # Home, IP Lookup, and Stellar to Airtable in one window.
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -2415,6 +2415,18 @@ function Get-IpAddressesFromText {
 
     foreach ($match in $colonMatches) {
         $token = $match.Value
+        # A MAC joined to dotted data is not an IPv6 fragment. Recover only
+        # an unambiguous four-octet suffix; never guess within a longer chain.
+        if ($token -match '^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\.(?<IpSuffix>.*)$') {
+            $ipSuffix = $matches['IpSuffix']
+            if ($ipSuffix -match '^\d{1,3}(?:\.\d{1,3}){3}$' -and
+                -not [string]::IsNullOrWhiteSpace((ConvertTo-NormalizedIpAddress -InputText $ipSuffix))) {
+                $candidateMatches += [PSCustomObject]@{
+                    Index = $match.Index; Value = $ipSuffix; ColonToken = $false
+                }
+            }
+            continue
+        }
         if ($token -notmatch '[0-9a-fA-F]') { continue }
         # Exclude JSON property separators, drive letters, clock times, MACs,
         # and IPv4 host:port suffixes from the potential-address column.
@@ -2602,6 +2614,250 @@ function ConvertTo-IpLookupYesNo {
     return "No"
 }
 
+# Return report text only: a single bullet, with original provider numbers.
+function Format-IpSocBullet {
+    param([string]$IpAddress, [hashtable]$Data, [string[]]$IpInfoDetails,
+          [string]$Location, [string]$Network, [string[]]$Unavailable)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    [void]$parts.Add("- $IpAddress - Public IP")
+    $attribution = @($IpInfoDetails | Where-Object { $_ -match '^(Location|Organization|ASN):' } |
+        ForEach-Object { $_ -replace '^(Location|Organization):\s*', '' -replace '\s+\([A-Z]{2}\)$', '' })
+    $info = $Data['IPinfo']
+    foreach ($field in @('org', 'isp', 'company')) {
+        $value = $info.$field
+        if ($null -ne $value -and $value -isnot [string]) { $value = $value.name }
+        $value = ConvertTo-IpLookupSingleLine -Value $value -MaximumLength 0
+        if ($field -eq 'org') { $value = $value -replace '^AS\d+\s+', '' }
+        if ($value -and $attribution -notcontains $value) { $attribution += $value }
+    }
+    $flags = @($IpInfoDetails | Where-Object { $_ -like 'Threat/context flags:*' } |
+        ForEach-Object { $_ -replace '^Threat/context flags:\s*', '' })
+    if ($attribution.Count -eq 0) {
+        $attribution = @($Location, $Network) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        if ($attribution.Count) { [void]$parts.Add("Attribution: $($attribution -join ', ')") }
+        if ($flags.Count) { [void]$parts.Add("IPinfo: $($flags -join '; ')") }
+    }
+    else {
+        $infoText = "IPinfo: $($attribution -join ', ')"
+        if ($flags.Count) { $infoText += "; $($flags -join '; ')" }
+        [void]$parts.Add($infoText)
+    }
+
+    $positive = $false
+    $strong = 0
+    $negativeChecks = 0
+    $exposureNeedsReview = $false
+    $otx = $Data['OTX']
+    if ($null -ne $otx) {
+        $details = @()
+        if (Test-IpLookupValueReported $otx.pulse_info 'count') {
+            $count = $otx.pulse_info.count
+            $details += "$count related pulses"
+            if ([double]$count -gt 0) { $positive = $true }
+            elseif ([double]$count -eq 0) { $negativeChecks++ }
+        }
+        if (Test-IpLookupValueReported $otx 'reputation') {
+            $details += "reputation $($otx.reputation)"
+            # Preserve nonzero provider reputation without guessing its scale.
+            if ([string]$otx.reputation -ne '0') { $exposureNeedsReview = $true }
+        }
+        $pulses = @($otx.pulse_info.pulses | Where-Object { $null -ne $_ })
+        $names = @($pulses | ForEach-Object { $_.name } | Where-Object { $_ } | Select-Object -Unique)
+        $tags = @($pulses | ForEach-Object { $_.tags } | Where-Object { $_ } | Select-Object -Unique)
+        if ($names.Count) { $details += "pulses: $($names -join '; ')"; $positive = $true }
+        if ($tags.Count) { $details += "tags: $($tags -join ', ')" }
+        if ($details.Count) { [void]$parts.Add("LevelBlue OTX: $($details -join ', ')") }
+    }
+
+    $vt = $Data['VirusTotal']
+    if ($null -ne $vt) {
+        $details = @()
+        foreach ($field in @('malicious', 'suspicious', 'harmless', 'undetected')) {
+            if (Test-IpLookupValueReported $vt.last_analysis_stats $field) {
+                $details += "$($vt.last_analysis_stats.$field) $field"
+            }
+        }
+        if ((Test-IpLookupValueReported $vt.last_analysis_stats 'malicious') -and [double]$vt.last_analysis_stats.malicious -gt 0) { $positive = $true }
+        if ((Test-IpLookupValueReported $vt.last_analysis_stats 'suspicious') -and [double]$vt.last_analysis_stats.suspicious -gt 0) { $positive = $true }
+        if ([double]$vt.last_analysis_stats.malicious -ge 5) { $strong++ }
+        if ((Test-IpLookupValueReported $vt.last_analysis_stats 'malicious') -and
+            (Test-IpLookupValueReported $vt.last_analysis_stats 'suspicious') -and
+            [double]$vt.last_analysis_stats.malicious -eq 0 -and [double]$vt.last_analysis_stats.suspicious -eq 0) { $negativeChecks++ }
+        if (Test-IpLookupValueReported $vt 'reputation') {
+            $details += "community reputation $($vt.reputation)"
+            if ([double]$vt.reputation -lt 0) { $positive = $true }
+        }
+        $votes = @()
+        foreach ($field in @('malicious', 'harmless')) {
+            if (Test-IpLookupValueReported $vt.total_votes $field) { $votes += "$($vt.total_votes.$field) $field" }
+        }
+        if ($votes.Count) { $details += "community votes: $($votes -join ', ')" }
+        if ([double]$vt.total_votes.malicious -gt 0) { $exposureNeedsReview = $true }
+        $engines = @($vt.last_analysis_results.PSObject.Properties | Where-Object {
+            $_.Value.category -in @('malicious', 'suspicious')
+        } | ForEach-Object {
+            if ($_.Value.engine_name) { $_.Value.engine_name } else { $_.Name }
+        } | Select-Object -Unique)
+        if ($engines.Count) { $details += "flagging engines: $($engines -join ', ')"; $positive = $true }
+        if (Test-IpLookupValueReported $vt 'last_analysis_date') {
+            $details += "last analysis $(ConvertFrom-IpLookupUnixTime $vt.last_analysis_date)"
+        }
+        if ($details.Count) { [void]$parts.Add("VirusTotal: $($details -join ', ')") }
+    }
+
+    $abuse = $Data['AbuseIPDB']
+    if ($null -ne $abuse) {
+        $details = @()
+        if (Test-IpLookupValueReported $abuse 'abuseConfidenceScore') {
+            $details += "$($abuse.abuseConfidenceScore)% abuse confidence"
+            if ([double]$abuse.abuseConfidenceScore -gt 0) { $positive = $true }
+            if ([double]$abuse.abuseConfidenceScore -ge 75) { $strong++ }
+        }
+        if (Test-IpLookupValueReported $abuse 'totalReports') {
+            $details += "$($abuse.totalReports) reports in 90 days"
+            if ([double]$abuse.totalReports -gt 0) { $positive = $true }
+        }
+        if ((Test-IpLookupValueReported $abuse 'abuseConfidenceScore') -and
+            (Test-IpLookupValueReported $abuse 'totalReports') -and
+            [double]$abuse.abuseConfidenceScore -eq 0 -and [double]$abuse.totalReports -eq 0) { $negativeChecks++ }
+        if (Test-IpLookupValueReported $abuse 'numDistinctUsers') { $details += "$($abuse.numDistinctUsers) distinct reporters" }
+        if (Test-IpLookupValueReported $abuse 'lastReportedAt') { $details += "last reported $(ConvertTo-IpLookupUtcTime $abuse.lastReportedAt)" }
+        if (Test-IpLookupValueReported $abuse 'isTor') { $details += "Tor exit node $(ConvertTo-IpLookupYesNo $abuse.isTor)" }
+        if (Test-IpLookupValueReported $abuse 'isWhitelisted') { $details += "whitelisted $(ConvertTo-IpLookupYesNo $abuse.isWhitelisted)" }
+        if ($details.Count) { [void]$parts.Add("AbuseIPDB: $($details -join ', ')") }
+    }
+
+    $db = $Data['IP-DB']
+    if ($null -ne $db) {
+        $details = @()
+        if (Test-IpLookupValueReported $db 'abuseConfidenceScore') {
+            $score = "$($db.abuseConfidenceScore)/100 abuse score"
+            if (Test-IpLookupValueReported $db 'scoreLabel') { $score += " ($($db.scoreLabel))" }
+            $details += $score
+            if ([double]$db.abuseConfidenceScore -gt 0) { $positive = $true }
+            if ([double]$db.abuseConfidenceScore -ge 75) { $strong++ }
+        }
+        elseif (Test-IpLookupValueReported $db 'scoreLabel') { $details += "provider rating $($db.scoreLabel)" }
+        if ([string]$db.scoreLabel -match '^(suspicious|critical)$') { $positive = $true }
+        foreach ($field in @('totalReports', 'distinctReporters')) {
+            if (Test-IpLookupValueReported $db $field) {
+                $label = if ($field -eq 'totalReports') { 'reports' } else { 'distinct reporters' }
+                $details += "$($db.$field) $label"
+            }
+        }
+        if ([double]$db.totalReports -gt 0) { $positive = $true }
+        if (Test-IpLookupValueReported $db 'lastReportedAt') { $details += "last reported $(ConvertTo-IpLookupUtcTime $db.lastReportedAt)" }
+        if (Test-IpLookupValueReported $db 'blacklistSources') {
+            $lists = @($db.blacklistSources | Where-Object { $_ } | Select-Object -Unique)
+            $details += "$($lists.Count) blocklist matches"
+            if ($lists.Count) { $details += ($lists -join ', '); $positive = $true }
+        }
+        if (Test-IpLookupValueReported $db 'dnsbl') {
+            $zones = @($db.dnsbl | Where-Object { $null -ne $_ -and $_.listed -ne $false })
+            $details += "$($zones.Count) DNSBL listings"
+            if ($zones.Count) {
+                $details += (@($zones | ForEach-Object {
+                    if ($_.label -and $_.label -ne $_.zone) { "$($_.zone) ($($_.label))" } else { $_.zone }
+                }) -join ', ')
+                $positive = $true
+            }
+        }
+        if ((Test-IpLookupValueReported $db 'abuseConfidenceScore') -and
+            (Test-IpLookupValueReported $db 'totalReports') -and
+            [double]$db.abuseConfidenceScore -eq 0 -and [double]$db.totalReports -eq 0) { $negativeChecks++ }
+        if (Test-IpLookupValueReported $db 'networkType') { $details += "network type $($db.networkType)" }
+        if ($null -ne $db.liftedListing) {
+            $history = @()
+            foreach ($field in @('priorScore', 'delistedAt', 'cycles', 'daysSince')) {
+                if (Test-IpLookupValueReported $db.liftedListing $field) { $history += "$field=$($db.liftedListing.$field)" }
+            }
+            if ($history.Count) { $details += "previous listing: $($history -join ', ')"; $exposureNeedsReview = $true }
+        }
+        if ($details.Count) { [void]$parts.Add("IP-DB: $($details -join ', ')") }
+    }
+
+    $shodan = $Data['Shodan']
+    if ($null -ne $shodan) {
+        $details = @()
+        $ports = @($shodan.ports | Where-Object { $null -ne $_ } | Select-Object -Unique)
+        $vulns = @($shodan.vulns | Where-Object { $_ } | Select-Object -Unique)
+        $products = @($shodan.cpes | Where-Object { $_ } | ForEach-Object {
+            $cpe = [string]$_ -split ':'
+            if ($cpe.Count -ge 6 -and $cpe[1] -eq '2.3') { $cpe = $cpe[3..5] }
+            elseif ($cpe.Count -ge 5 -and $cpe[1] -match '^/[aoh]$') { $cpe = $cpe[2..4] }
+            else { $cpe = @([string]$_) }
+            (@($cpe | Where-Object { $_ -and $_ -ne '*' -and $_ -ne '-' }) -join ' ')
+        } | Select-Object -Unique)
+        $tags = @($shodan.tags | Where-Object { $_ } | Select-Object -Unique)
+        if ($ports.Count) { $details += "open ports $($ports -join ', ')" }
+        if ($products.Count) { $details += "observed products $($products -join ', ')" }
+        if ($tags.Count) { $details += "tags $($tags -join ', ')" }
+        if ($vulns.Count) { $details += "potential vulnerabilities $($vulns -join ', ') (verify applicability)"; $exposureNeedsReview = $true }
+        if (($tags -join ' ') -match '(?i)malware|botnet|command.and.control|(^|\W)c2($|\W)|compromised') { $positive = $true }
+        if ($details.Count) { [void]$parts.Add("Shodan: $($details -join '; ')") }
+    }
+    if ($Unavailable.Count) { [void]$parts.Add("Coverage limited: $($Unavailable -join ', ')") }
+    # Keep the existing 5-engine / 75-score high-risk thresholds, and require
+    # corroboration before calling the reputation malicious. This is no case verdict.
+    if ($strong -ge 2 -and $null -ne $vt -and [double]$vt.last_analysis_stats.malicious -ge 5) {
+        $assessment = 'Malicious reputation - corroborating threat intelligence detections'
+    }
+    elseif ($positive) { $assessment = 'Suspicious - reported threat or abuse indicators require investigation' }
+    elseif ($exposureNeedsReview) { $assessment = 'Requires further investigation - reputation history or exposed services need review' }
+    elseif ($negativeChecks -ge 2) { $assessment = 'Clean in available results - no identified threat indicators' }
+    else { $assessment = 'Requires further investigation - insufficient reputation data' }
+    [void]$parts.Add($assessment)
+    # Provider strings are untrusted data, not instructions or Markdown.
+    return (($parts -join ' - ') -replace '[\r\n]+', ' ' -replace '[\u2013\u2014]', '-' -replace '[`*]', '')
+}
+
+function Format-CaseIpSocReport {
+    param([string[]]$Descriptions, [string[]]$IpBullets)
+    if ($IpBullets.Count -eq 0) { return '' }
+    $introduction = 'IP addresses extracted from the supplied alert text were reviewed using available reputation sources.'
+    $description = @($Descriptions | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+    if ($description.Count) {
+        $text = ConvertTo-IpLookupSingleLine $description[0] -MaximumLength 0
+        $introduction = ($text -split '(?<=[.!?])\s+(?=[A-Z])', 2)[0]
+    }
+    if (@($IpBullets | Where-Object { $_ -match ' - (Suspicious|Malicious reputation) - ' }).Count) {
+        $conclusion = 'Reported threat or abuse indicators require correlation with the observed alert activity. The available evidence does not establish a case verdict.'
+    }
+    elseif (@($IpBullets | Where-Object { $_ -match 'Requires further investigation' }).Count) {
+        $conclusion = 'Further investigation is required to resolve the reputation gaps or findings and determine a case verdict.'
+    }
+    elseif (@($IpBullets | Where-Object { $_ -match 'Clean in available results' }).Count) {
+        $conclusion = 'No threat indicators were identified in the available reputation results. Verify the alert activity before determining a case verdict.'
+    }
+    else { $conclusion = 'Private or reserved IPs have no public reputation assessment. Verify the alert activity before determining a case verdict.' }
+    # IP reputation alone cannot establish whether the alert is a TP or FP.
+    return ((@($introduction, ($IpBullets -join "`r`n"), $conclusion) -join "`r`n`r`n") -replace '[\u2013\u2014]', '-' -replace '[`*]', '')
+}
+
+function Enable-IpBulletClickToCopy {
+    param([System.Windows.Forms.TextBox]$TextBox)
+    $TextBox.Add_MouseClick({
+        param($sender, $eventArgs)
+        if ($eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $index = $sender.GetCharIndexFromPosition($eventArgs.Location)
+        foreach ($match in [regex]::Matches($sender.Text, '(?m)^- (?<Ip>[0-9a-fA-F:.%]+) - ')) {
+            $ipGroup = $match.Groups['Ip']
+            if ($index -ge $ipGroup.Index -and $index -lt ($ipGroup.Index + $ipGroup.Length)) {
+                $ip = ConvertTo-NormalizedIpAddress $ipGroup.Value
+                if ($ip) {
+                    $sender.Select($ipGroup.Index, $ipGroup.Length)
+                    try {
+                        [System.Windows.Forms.Clipboard]::SetText($ip)
+                    }
+                    catch { } # Leave the selected text available for Ctrl+C.
+                }
+                break
+            }
+        }
+    })
+}
+
 function Get-IpThreatLocationSummary {
     param(
         [Parameter(Mandatory = $true)]
@@ -2614,15 +2870,19 @@ function Get-IpThreatLocationSummary {
     )
 
     $newLine = [Environment]::NewLine
+    if ($ParsedAddress.IsIPv4MappedToIPv6) {
+        $ParsedAddress = $ParsedAddress.MapToIPv4()
+        $IpAddress = $ParsedAddress.ToString()
+    }
 
     if (-not (Test-IpAddressIsPublic -Address $ParsedAddress)) {
-        return @(
-            "IP: $IpAddress"
-            "OVERALL: PRIVATE OR RESERVED ADDRESS"
-            ""
-            "This address is not publicly routable, so it was not sent to external services."
-            "Public geolocation and reputation results do not apply to it."
-        ) -join $newLine
+        $classification = if ($ParsedAddress.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+            ($ParsedAddress.GetAddressBytes()[0] -eq 10 -or
+             ($ParsedAddress.GetAddressBytes()[0] -eq 172 -and $ParsedAddress.GetAddressBytes()[1] -ge 16 -and $ParsedAddress.GetAddressBytes()[1] -le 31) -or
+             ($ParsedAddress.GetAddressBytes()[0] -eq 192 -and $ParsedAddress.GetAddressBytes()[1] -eq 168))) { 'Private IP' }
+            elseif ($ParsedAddress.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and ($ParsedAddress.GetAddressBytes()[0] -band 0xFE) -eq 0xFC) { 'Private IP' }
+            else { 'Reserved IP' }
+        return "- $IpAddress - $classification - Not publicly routable; no external lookup - Public reputation does not apply"
     }
 
     $encodedIp = [Uri]::EscapeDataString($IpAddress)
@@ -3718,114 +3978,26 @@ function Get-IpThreatLocationSummary {
         }
     }
 
-    if ($hasHighThreatSignal) {
-        $overall = "HIGH-RISK SIGNALS"
-    }
-    elseif ($hasPossibleThreatSignal) {
-        $overall = "POSSIBLE THREAT SIGNALS"
-    }
-    elseif ($threatSourcesWithAssessment -gt 0) {
-        $overall = "NO THREAT FLAGS FOUND"
-    }
-    else {
-        $overall = "LIMITED THREAT DATA"
-    }
-
-    if ($socSignals.Count -eq 0) {
-        if ($threatSourcesWithAssessment -gt 0) {
-            $socSignals = @("No positive threat signals were returned by the responding threat feeds.")
-        }
-        elseif ($threatSourcesChecked -gt 0) {
-            $socSignals = @("Threat feeds responded but did not return a usable threat assessment.")
-        }
+    # Retain only successful response objects. Missing values are never zeros.
+    $socProviderData = @{}
+    $socUnavailable = @()
+    if ($ipInfoDetails[0] -match 'data received') { $socProviderData['IPinfo'] = $ipInfo }
+    foreach ($source in @(
+        @{ Name = 'OTX'; Details = $otxDetails; Data = $otx }
+        @{ Name = 'VirusTotal'; Details = $virusTotalDetails; Data = $virusTotalAttributes }
+        @{ Name = 'AbuseIPDB'; Details = $abuseIpDbDetails; Data = $abuseData }
+        @{ Name = 'IP-DB'; Details = $ipDbDetails; Data = $ipDb }
+    )) {
+        if ($source.Details[0] -match 'data received') { $socProviderData[$source.Name] = $source.Data }
         else {
-            $socSignals = @("No threat feed responded; review the provider status lines below.")
+            $state = if ($source.Details[0] -match 'Not checked') { 'not configured' } else { 'unavailable' }
+            $socUnavailable += "$($source.Name) $state"
         }
     }
-
-    # Case IP Lookups uses the compact SOC view. Each provider remains separate, but
-    # secondary enrichment fields are removed so the analyst can scan the
-    # location, ownership, domain, and threat findings quickly.
-    if ($ImportantOnly) {
-        $ipInfoDetails = @(
-            $ipInfoDetails | Where-Object {
-                [string]$_ -match '^(Status|Location|Domain name / reverse DNS|ASN|Organization|Organization domain|Network range|Threat/context flags):'
-            }
-        )
-
-        $otxDetails = @(
-            $otxDetails | Where-Object {
-                [string]$_ -match '^(Status|Location|Domain names / passive DNS|ASN / network owner|Threat detection|Pulse names|Tags):'
-            }
-        )
-
-        $virusTotalDetails = @(
-            $virusTotalDetails | Where-Object {
-                [string]$_ -match '^(Status|Location|Domain names / recent DNS|HTTPS certificate name|ASN|Network owner|Network range|Threat detection|Community reputation|Last analysis|Flagging engines|Tags):'
-            }
-        )
-
-        $abuseIpDbDetails = @(
-            $abuseIpDbDetails | Where-Object {
-                [string]$_ -match '^(Status|Location|Domain name|Hostnames|Network owner / ISP|Usage type|Threat detection|Last reported):'
-            }
-        )
-    }
-
-    $summaryLines = @(
-        "IP: $IpAddress"
-        "OVERALL: $overall"
-        "Providers responding: $providerResponses of 6"
-        "Threat feeds checked: $threatSourcesChecked of 4"
-        ""
-        "QUICK SOC FLAGS / CONTEXT"
-        $socSignals
-    )
-
-    $combinedAttributionDetails = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($location)) {
-        $combinedAttributionDetails += "Location: $location"
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($network)) {
-        $combinedAttributionDetails += "Network/owner: $network"
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($hostname)) {
-        $combinedAttributionDetails += "Hostname: $hostname"
-    }
-
-    if (-not $ImportantOnly -and $combinedAttributionDetails.Count -gt 0) {
-        $summaryLines += ""
-        $summaryLines += "COMBINED ATTRIBUTION"
-        $summaryLines += $combinedAttributionDetails
-    }
-
-    $summaryLines += @(
-        ""
-        "1. IPINFO"
-        $ipInfoDetails
-        ""
-        "2. LEVELBLUE OTX"
-        $otxDetails
-        ""
-        "3. VIRUSTOTAL"
-        $virusTotalDetails
-        ""
-        "4. ABUSEIPDB"
-        $abuseIpDbDetails
-        ""
-        "5. IP-DB"
-        $ipDbDetails
-        ""
-        "6. SHODAN INTERNETDB"
-        $shodanDetails
-        ""
-        "Analyst note: Reputation is point-in-time context. Corroborate it with the alert, logs, asset role, direction of traffic, and observed behavior."
-    )
-
-    return $summaryLines -join $newLine
+    if ($shodanDetails[0] -match 'data received') { $socProviderData['Shodan'] = $shodan }
+    elseif ($shodanDetails[0] -notmatch 'HTTP 404') { $socUnavailable += 'Shodan unavailable' }
+    return Format-IpSocBullet -IpAddress $IpAddress -Data $socProviderData `
+        -IpInfoDetails $ipInfoDetails -Location $location -Network $network -Unavailable $socUnavailable
 }
 
 # ------------------------------------------------------------
@@ -3950,6 +4122,7 @@ $ipSummaryBox = New-Object System.Windows.Forms.TextBox
 $ipSummaryBox.Location = New-Object System.Drawing.Point(400,50)
 $ipSummaryBox.Size = New-Object System.Drawing.Size(290,460)
 $ipSummaryBox.Multiline = $true
+Enable-IpBulletClickToCopy -TextBox $ipSummaryBox
 $ipSummaryBox.ScrollBars = "Vertical"
 $ipSummaryBox.Text = "Run a lookup to see where the IP is from and whether threat-intelligence sources report it."
 $ipSummaryBox.Anchor = "Top, Bottom, Left, Right"
@@ -4328,8 +4501,7 @@ $ipRunLookupAction = {
     }
     catch {
         $ipSummaryBox.Text = (
-            "IP: $ipIp`r`nOVERALL: SUMMARY UNAVAILABLE`r`n`r`n" +
-            "The lookup websites can still be reviewed in Chrome."
+            "- $ipIp - Public IP - Requires further investigation - Reputation lookup unavailable"
         )
     }
     finally {
@@ -4539,7 +4711,7 @@ $caseIpPublicLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 95, 160)
 $caseIpTab.Controls.Add($caseIpPublicLabel)
 
 $caseIpPrivateList = New-Object System.Windows.Forms.ListBox
-$caseIpPrivateList.Size = New-Object System.Drawing.Size(210, 120)
+$caseIpPrivateList.Size = New-Object System.Drawing.Size(210, 60)
 $caseIpPrivateList.Location = New-Object System.Drawing.Point(20, 200)
 $caseIpPrivateList.HorizontalScrollbar = $true
 $caseIpPrivateList.BackColor = [System.Drawing.Color]::White
@@ -4554,7 +4726,7 @@ $caseIpPotentialLabel.ForeColor = [System.Drawing.Color]::FromArgb(150, 100, 25)
 $caseIpTab.Controls.Add($caseIpPotentialLabel)
 
 $caseIpPotentialList = New-Object System.Windows.Forms.ListBox
-$caseIpPotentialList.Size = New-Object System.Drawing.Size(150, 120)
+$caseIpPotentialList.Size = New-Object System.Drawing.Size(150, 60)
 $caseIpPotentialList.Location = New-Object System.Drawing.Point(245, 200)
 $caseIpPotentialList.HorizontalScrollbar = $true
 $caseIpPotentialList.BackColor = [System.Drawing.Color]::White
@@ -4571,8 +4743,8 @@ $caseIpTab.Controls.Add($caseIpPublicList)
 
 $caseIpRunButton = New-Object System.Windows.Forms.Button
 $caseIpRunButton.Text = "Look Up All Public IPs"
-$caseIpRunButton.Size = New-Object System.Drawing.Size(180, 32)
-$caseIpRunButton.Location = New-Object System.Drawing.Point(20, 335)
+$caseIpRunButton.Size = New-Object System.Drawing.Size(165, 26)
+$caseIpRunButton.Location = New-Object System.Drawing.Point(20, 352)
 $caseIpRunButton.FlatStyle = "Flat"
 $caseIpRunButton.FlatAppearance.BorderSize = 0
 $caseIpRunButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
@@ -4582,8 +4754,8 @@ $caseIpTab.Controls.Add($caseIpRunButton)
 
 $caseIpCopyButton = New-Object System.Windows.Forms.Button
 $caseIpCopyButton.Text = "Copy Results"
-$caseIpCopyButton.Size = New-Object System.Drawing.Size(110, 32)
-$caseIpCopyButton.Location = New-Object System.Drawing.Point(210, 335)
+$caseIpCopyButton.Size = New-Object System.Drawing.Size(100, 26)
+$caseIpCopyButton.Location = New-Object System.Drawing.Point(195, 352)
 $caseIpCopyButton.FlatStyle = "Flat"
 $caseIpCopyButton.FlatAppearance.BorderSize = 0
 $caseIpCopyButton.BackColor = [System.Drawing.Color]::FromArgb(90, 105, 120)
@@ -4591,19 +4763,30 @@ $caseIpCopyButton.ForeColor = [System.Drawing.Color]::White
 $caseIpCopyButton.Enabled = $false
 $caseIpTab.Controls.Add($caseIpCopyButton)
 
+$caseIpClearButton = New-Object System.Windows.Forms.Button
+$caseIpClearButton.Text = 'Clear IP Lookup'
+$caseIpClearButton.Size = New-Object System.Drawing.Size(120, 26)
+$caseIpClearButton.Location = New-Object System.Drawing.Point(305, 352)
+$caseIpClearButton.FlatStyle = 'Flat'
+$caseIpClearButton.FlatAppearance.BorderSize = 0
+$caseIpClearButton.BackColor = [System.Drawing.Color]::FromArgb(150, 65, 55)
+$caseIpClearButton.ForeColor = [System.Drawing.Color]::White
+$caseIpTab.Controls.Add($caseIpClearButton)
+
 $caseIpStatusLabel = New-Object System.Windows.Forms.Label
 $caseIpStatusLabel.Text = "Paste JSON and select Check JSON."
 $caseIpStatusLabel.AutoSize = $false
-$caseIpStatusLabel.Size = New-Object System.Drawing.Size(345, 32)
-$caseIpStatusLabel.Location = New-Object System.Drawing.Point(335, 335)
+$caseIpStatusLabel.Size = New-Object System.Drawing.Size(245, 26)
+$caseIpStatusLabel.Location = New-Object System.Drawing.Point(435, 352)
 $caseIpStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
 $caseIpStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(75, 85, 95)
 $caseIpTab.Controls.Add($caseIpStatusLabel)
 
 $caseIpResultsBox = New-Object System.Windows.Forms.TextBox
-$caseIpResultsBox.Location = New-Object System.Drawing.Point(20, 380)
-$caseIpResultsBox.Size = New-Object System.Drawing.Size(660, 240)
+$caseIpResultsBox.Location = New-Object System.Drawing.Point(20, 390)
+$caseIpResultsBox.Size = New-Object System.Drawing.Size(660, 230)
 $caseIpResultsBox.Multiline = $true
+Enable-IpBulletClickToCopy -TextBox $caseIpResultsBox
 $caseIpResultsBox.ScrollBars = "Vertical"
 $caseIpResultsBox.BackColor = [System.Drawing.Color]::White
 $caseIpResultsBox.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
@@ -4612,7 +4795,133 @@ $caseIpResultsBox.Font = New-Object System.Drawing.Font("Consolas", 10)
 $caseIpResultsBox.Text = "Tab 5 - Case IP Lookups checks the main sources (IPinfo, LevelBlue OTX, VirusTotal, AbuseIPDB) and supplemental sources (IP-DB and Shodan InternetDB, outside the four main sources). The supplemental sources are also queried in Tab 2 - IP Lookup."
 $caseIpTab.Controls.Add($caseIpResultsBox)
 
+$caseIpDescriptionLabel = New-Object System.Windows.Forms.LinkLabel
+$caseIpDescriptionLabel.Text = 'Description (click to copy)'
+$caseIpDescriptionLabel.AutoSize = $false
+$caseIpDescriptionLabel.Size = New-Object System.Drawing.Size(375, 16)
+$caseIpDescriptionLabel.Location = New-Object System.Drawing.Point(20, 262)
+$caseIpDescriptionLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 45, 55)
+$caseIpDescriptionLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
+$caseIpDescriptionLabel.LinkBehavior = [System.Windows.Forms.LinkBehavior]::HoverUnderline
+$caseIpDescriptionLabel.Enabled = $false
+$caseIpTab.Controls.Add($caseIpDescriptionLabel)
+
+$caseIpDescriptionPanel = New-Object System.Windows.Forms.Panel
+$caseIpDescriptionPanel.Location = New-Object System.Drawing.Point(20, 280)
+$caseIpDescriptionPanel.Size = New-Object System.Drawing.Size(375, 64)
+$caseIpDescriptionPanel.AutoScroll = $true
+$caseIpDescriptionPanel.BackColor = [System.Drawing.Color]::White
+$caseIpDescriptionPanel.BorderStyle = 'FixedSingle'
+$caseIpDescriptionPanel.Cursor = [System.Windows.Forms.Cursors]::Hand
+$caseIpTab.Controls.Add($caseIpDescriptionPanel)
+
+# A wrapping label displays the description; it is not an editable text box.
+$caseIpDescriptionBox = New-Object System.Windows.Forms.Label
+$caseIpDescriptionBox.Location = New-Object System.Drawing.Point(4, 4)
+$caseIpDescriptionBox.AutoSize = $true
+$caseIpDescriptionBox.MaximumSize = New-Object System.Drawing.Size(345, 0)
+$caseIpDescriptionBox.BackColor = [System.Drawing.Color]::Transparent
+$caseIpDescriptionBox.ForeColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+$caseIpDescriptionBox.Cursor = [System.Windows.Forms.Cursors]::Hand
+$caseIpDescriptionBox.UseMnemonic = $false
+$caseIpDescriptionPanel.Controls.Add($caseIpDescriptionBox)
+
+$caseIpDescriptionHistory = New-Object System.Collections.Generic.List[string]
+$caseIpDescriptionSeenJson = New-Object System.Collections.Generic.HashSet[string]
+# Report context is separate from the extra paragraphs copied to Airtable.
+$caseIpReportDescriptions = New-Object System.Collections.Generic.List[string]
+$caseIpRefreshDescriptionAction = {
+    param([string]$Text)
+    # Read every complete JSON block, including a second object pasted after
+    # the first. Advance past each whole value so nested records are not repeated.
+    $caseIpRemainingDescriptionText = $Text
+    while (-not [string]::IsNullOrWhiteSpace($caseIpRemainingDescriptionText)) {
+        $caseIpDescriptionJson = Get-JsonFromText -Text $caseIpRemainingDescriptionText
+        if ([string]::IsNullOrWhiteSpace($caseIpDescriptionJson)) { break }
+        $caseIpIncomingDescription = Get-StellarAlertDescription -JsonText $caseIpDescriptionJson
+        if (-not [string]::IsNullOrWhiteSpace($caseIpIncomingDescription) -and
+            -not $caseIpReportDescriptions.Contains($caseIpIncomingDescription.Trim())) {
+            [void]$caseIpReportDescriptions.Add($caseIpIncomingDescription.Trim())
+        }
+        if (-not [string]::IsNullOrWhiteSpace($caseIpIncomingDescription) -and
+            $caseIpDescriptionSeenJson.Add($caseIpDescriptionJson)) {
+            [void]$caseIpDescriptionHistory.Add($caseIpIncomingDescription.Trim())
+        }
+        $caseIpDescriptionEnd = $caseIpRemainingDescriptionText.IndexOf(
+            $caseIpDescriptionJson, [StringComparison]::Ordinal
+        ) + $caseIpDescriptionJson.Length
+        $caseIpRemainingDescriptionText = $caseIpRemainingDescriptionText.Substring($caseIpDescriptionEnd)
+    }
+    $caseIpDescriptionPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, 0)
+    $caseIpDescriptionBox.Text = $caseIpDescriptionHistory -join "`r`n`r`n"
+    $caseIpDescriptionLabel.Text = 'Description (click to copy)'
+    $caseIpDescriptionLabel.LinkColor = [System.Drawing.Color]::Blue
+    $caseIpDescriptionLabel.Enabled = -not [string]::IsNullOrWhiteSpace($caseIpDescriptionBox.Text)
+}
+
+# Descriptions accumulate only when Check JSON is explicitly selected.
+
+# The title, text, and unused space in the panel all support hover and copy.
+foreach ($caseIpDescriptionControl in @($caseIpDescriptionLabel, $caseIpDescriptionPanel, $caseIpDescriptionBox)) {
+    $caseIpDescriptionControl.Add_MouseEnter({
+        if (-not [string]::IsNullOrWhiteSpace($caseIpDescriptionBox.Text)) {
+            $caseIpDescriptionLabel.BackColor = [System.Drawing.Color]::FromArgb(220, 238, 255)
+            $caseIpDescriptionPanel.BackColor = [System.Drawing.Color]::FromArgb(235, 246, 255)
+        }
+    })
+    $caseIpDescriptionControl.Add_MouseLeave({
+        $caseIpDescriptionLabel.BackColor = [System.Drawing.Color]::Transparent
+        $caseIpDescriptionPanel.BackColor = [System.Drawing.Color]::White
+    })
+}
+
+$caseIpCopyDescriptionAction = {
+    if (-not [string]::IsNullOrWhiteSpace($caseIpDescriptionBox.Text)) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($caseIpDescriptionBox.Text)
+            $caseIpDescriptionLabel.Text = 'Description (copied!)'
+            $caseIpDescriptionLabel.LinkColor = [System.Drawing.Color]::FromArgb(25, 125, 65)
+            $caseIpStatusLabel.Text = 'Description copied.'
+        }
+        catch {
+            $caseIpStatusLabel.Text = 'Clipboard busy; click the Description area again.'
+        }
+    }
+}
+$caseIpDescriptionLabel.Add_LinkClicked($caseIpCopyDescriptionAction)
+$caseIpDescriptionPanel.Add_Click($caseIpCopyDescriptionAction)
+$caseIpDescriptionBox.Add_Click($caseIpCopyDescriptionAction)
+
+
 $caseIpAddressByDisplay = @{}
+# Keep completed report sections until the analyst explicitly clears them.
+$caseIpResultHistory = New-Object System.Collections.Generic.List[string]
+# Remember normalized public IPs attempted in this case until Clear IP Lookup.
+$caseIpLookedUpAddresses = New-Object System.Collections.Generic.HashSet[string]
+$caseIpReportedLocalAddresses = New-Object System.Collections.Generic.HashSet[string]
+$caseIpRenderReportAction = {
+    $caseIpResultsBox.Text = Format-CaseIpSocReport -Descriptions $caseIpReportDescriptions.ToArray() -IpBullets $caseIpResultHistory.ToArray()
+}
+
+$caseIpClearAction = {
+    $caseIpResultHistory.Clear()
+    $caseIpLookedUpAddresses.Clear()
+    $caseIpReportedLocalAddresses.Clear()
+    $caseIpReportDescriptions.Clear()
+    $caseIpResultsBox.Clear()
+    $caseIpDescriptionHistory.Clear()
+    $caseIpDescriptionSeenJson.Clear()
+    $caseIpDescriptionBox.Text = ''
+    $caseIpDescriptionPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, 0)
+    $caseIpDescriptionPanel.BackColor = [System.Drawing.Color]::White
+    $caseIpDescriptionLabel.Text = 'Description (click to copy)'
+    $caseIpDescriptionLabel.LinkColor = [System.Drawing.Color]::Blue
+    $caseIpDescriptionLabel.BackColor = [System.Drawing.Color]::Transparent
+    $caseIpDescriptionLabel.Enabled = $false
+    $caseIpCopyButton.Enabled = $false
+    $caseIpStatusLabel.Text = 'Description and IP lookup results cleared.'
+}
+$caseIpClearButton.Add_Click($caseIpClearAction)
 
 # Clicking a list copies the address or potential fragment that was clicked.
 $caseIpPrivateList.Add_MouseClick({
@@ -4695,6 +5004,9 @@ $caseIpRefreshAction = {
             }
             else {
                 [void]$caseIpPrivateList.Items.Add($caseIpDisplay)
+                if ($caseIpReportedLocalAddresses.Add([string]$caseIpRecord.Address)) {
+                    [void]$caseIpResultHistory.Add((Get-IpThreatLocationSummary -IpAddress $caseIpRecord.Address -ParsedAddress $caseIpRecord.ParsedAddress -ImportantOnly))
+                }
             }
         }
     }
@@ -4704,13 +5016,16 @@ $caseIpRefreshAction = {
         $caseIpPotentialList.EndUpdate()
     }
 
+    if ($caseIpResultHistory.Count -gt 0) { & $caseIpRenderReportAction }
     $caseIpPrivateLabel.Text = "Private / Reserved ($($caseIpPrivateList.Items.Count))"
     $caseIpPublicLabel.Text = "Public ($($caseIpPublicList.Items.Count))"
     $caseIpPotentialLabel.Text = "Potential IP Addresses ($($caseIpPotentialList.Items.Count))"
     $caseIpPotentialRunButton.Enabled = ($caseIpPotentialList.Items.Count -gt 0)
     $caseIpRunButton.Enabled = ($caseIpPublicList.Items.Count -gt 0)
-    $caseIpCopyButton.Enabled = $false
-    $caseIpResultsBox.Text = "Tab 5 - Case IP Lookups checks the main sources (IPinfo, LevelBlue OTX, VirusTotal, AbuseIPDB) and supplemental sources (IP-DB and Shodan InternetDB, outside the four main sources). The supplemental sources are also queried in Tab 2 - IP Lookup."
+    $caseIpCopyButton.Enabled = ($caseIpResultHistory.Count -gt 0)
+    if ($caseIpResultHistory.Count -eq 0) {
+        $caseIpResultsBox.Text = "Tab 5 - Case IP Lookups checks the main sources (IPinfo, LevelBlue OTX, VirusTotal, AbuseIPDB) and supplemental sources (IP-DB and Shodan InternetDB, outside the four main sources). The supplemental sources are also queried in Tab 2 - IP Lookup."
+    }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         $caseIpStatusLabel.Text = "No case text or JSON has been pasted yet."
@@ -4730,20 +5045,22 @@ $caseIpRunLookupAction = {
         return
     }
 
-    # Always discard manual changes and rebuild the report from the APIs.
-    $caseIpResultsBox.Clear()
+    # Append new API report sections to previous lookups.
+    # Disable Clear during DoEvents so an active run cannot repopulate a reset.
+    $caseIpClearButton.Enabled = $false
     $caseIpCheckJsonButton.Enabled = $false
     $caseIpPotentialRunButton.Enabled = $false
     $caseIpJsonInputBox.Enabled = $false
     $caseIpRunButton.Enabled = $false
     $caseIpCopyButton.Enabled = $false
     $mainForm.UseWaitCursor = $true
-    $caseIpResultSections = New-Object System.Collections.Generic.List[string]
+    $caseIpResultSections = $caseIpResultHistory
 
     try {
         $caseIpLookupNumber = 0
         $caseIpLookupTotal = $caseIpLookupItems.Count
         $caseIpQueriedCount = 0
+        $caseIpDuplicateCount = 0
         $caseIpSkippedCount = 0
 
         foreach ($caseIpListItem in $caseIpLookupItems) {
@@ -4764,13 +5081,21 @@ $caseIpRunLookupAction = {
             if ([string]::IsNullOrWhiteSpace($caseIpNormalizedAddress) -or
                 -not [System.Net.IPAddress]::TryParse($caseIpNormalizedAddress, [ref]$caseIpParsedAddress)) {
                 $caseIpSkippedCount++
-                $caseIpSummary = "Potential IP: $caseIpAddress`r`nSKIPPED: Incomplete or invalid IP address. Supply the complete address and select Check JSON."
+                # An invalid fragment is not an IP and does not belong in the report.
+                continue
             }
             elseif (-not (Test-IpAddressIsPublic -Address $caseIpParsedAddress)) {
                 $caseIpSkippedCount++
-                $caseIpSummary = "IP: $caseIpAddress`r`nSKIPPED: Private or reserved address; no external lookup."
+                if (-not $caseIpReportedLocalAddresses.Add($caseIpNormalizedAddress)) { continue }
+                $caseIpSummary = Get-IpThreatLocationSummary -IpAddress $caseIpNormalizedAddress -ParsedAddress $caseIpParsedAddress -ImportantOnly
             }
             else {
+                # Add before querying so repeat JSONs, button clicks, and even
+                # failed attempts cannot query the same public IP until Clear.
+                if (-not $caseIpLookedUpAddresses.Add($caseIpNormalizedAddress)) {
+                    $caseIpDuplicateCount++
+                    continue
+                }
                 $caseIpQueriedCount++
                 try {
                     $caseIpSummary = Get-IpThreatLocationSummary `
@@ -4779,31 +5104,31 @@ $caseIpRunLookupAction = {
                         -ImportantOnly
                 }
                 catch {
-                    $caseIpSummary = "IP: $caseIpAddress`r`nOVERALL: SUMMARY UNAVAILABLE"
+                    $caseIpSummary = "- $caseIpNormalizedAddress - Public IP - Requires further investigation - Reputation lookup unavailable"
                 }
             }
 
             [void]$caseIpResultSections.Add($caseIpSummary)
-            $caseIpResultsBox.Text = $caseIpResultSections -join (
-                "`r`n`r`n" + ("=" * 68) + "`r`n`r`n"
-            )
+            & $caseIpRenderReportAction
             $caseIpResultsBox.SelectionStart = $caseIpResultsBox.Text.Length
             $caseIpResultsBox.ScrollToCaret()
             [System.Windows.Forms.Application]::DoEvents()
         }
 
-        $caseIpResultsBox.SelectionStart = 0
+        $caseIpResultsBox.SelectionStart = $caseIpResultsBox.Text.Length
         $caseIpResultsBox.ScrollToCaret()
         $caseIpCopyButton.Enabled = ($caseIpResultSections.Count -gt 0)
         if ($IncludePotential) {
-            $caseIpStatusLabel.Text = "Potential: $caseIpQueriedCount lookup(s), $caseIpSkippedCount skipped."
+            $caseIpStatusLabel.Text = "$caseIpQueriedCount new; $caseIpSkippedCount skipped; $caseIpDuplicateCount checked."
         }
         else {
-            $caseIpStatusLabel.Text = "$caseIpQueriedCount lookup(s); $($caseIpPotentialList.Items.Count) potential held."
+            $caseIpStatusLabel.Text = "$caseIpQueriedCount new; $caseIpDuplicateCount already checked."
         }
     }
     finally {
         $mainForm.UseWaitCursor = $false
+        $caseIpClearButton.Enabled = $true
+        $caseIpCopyButton.Enabled = ($caseIpResultHistory.Count -gt 0)
         $caseIpCheckJsonButton.Enabled = $true
         $caseIpJsonInputBox.Enabled = $true
         $caseIpPotentialRunButton.Enabled = ($caseIpPotentialList.Items.Count -gt 0)
@@ -4821,6 +5146,7 @@ $caseIpPotentialRunButton.Add_Click({
 
 $caseIpCheckJsonButton.Add_Click({
     $caseIpPastedJson = $caseIpJsonInputBox.Text
+    & $caseIpRefreshDescriptionAction -Text $caseIpPastedJson
 
     # Reuse the same IP extraction used by Fill Airtable, then immediately run
     # the public-IP summaries so this tab can be used independently.
@@ -4831,11 +5157,13 @@ $caseIpCheckJsonButton.Add_Click({
     }
     elseif (-not [string]::IsNullOrWhiteSpace($caseIpPastedJson)) {
         $caseIpStatusLabel.Text = "No public IP addresses were found in the pasted JSON."
-        $caseIpResultsBox.Text = (
-            "No public IP addresses were sent to external services.`r`n" +
-            "Private and reserved addresses remain listed above.`r`n" +
-            "Potential IPs are held for the Run Potential IPs button."
-        )
+        if ($caseIpResultHistory.Count -eq 0) {
+            $caseIpResultsBox.Text = (
+                "No public IP addresses were sent to external services.`r`n" +
+                "Private and reserved addresses remain listed above.`r`n" +
+                "Potential IPs are held for the Run Potential IPs button."
+            )
+        }
     }
 })
 
@@ -4930,39 +5258,239 @@ foreach ($stellarAnalyst in $stellarAnalysts) {
 # FILL AIRTABLE BUTTON
 # ==========================================
 
+function Invoke-SocOutlookBodyWorker {
+    param([string]$Body, [string]$Marker, [int]$TimeoutSeconds = 25)
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SocOutlookWindow {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint id);
+}
+'@
+    # Only the newly opened compose body contains this per-click marker.
+    # Require its body label as well, so a page-wide web document cannot match.
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $window = [SocOutlookWindow]::GetForegroundWindow()
+            [uint32]$ownerId = 0
+            [void][SocOutlookWindow]::GetWindowThreadProcessId($window, [ref]$ownerId)
+            $owner = [Diagnostics.Process]::GetProcessById($ownerId)
+            if ($owner.ProcessName -notin @('olk', 'OUTLOOK')) {
+                Start-Sleep -Milliseconds 250
+                continue
+            }
+            $root = [Windows.Automation.AutomationElement]::FromHandle($window)
+            $controls = $root.FindAll(
+                [Windows.Automation.TreeScope]::Descendants,
+                (New-Object Windows.Automation.OrCondition(
+                    (New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Document)),
+                    (New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit))
+                ))
+            )
+            $bodyCandidates = @()
+            foreach ($control in $controls) {
+                if ($control.Current.IsOffscreen -or -not $control.Current.IsEnabled -or
+                    $control.Current.Name -notmatch '(?i)^(message body|body of (the )?message|message content|body)(\b|$)') { continue }
+                $pattern = $null
+                if ($control.TryGetCurrentPattern([Windows.Automation.TextPattern]::Pattern, [ref]$pattern) -and
+                    $pattern.DocumentRange.GetText(-1).Contains($Marker)) {
+                    $bodyCandidates += $control
+                }
+            }
+            if ($bodyCandidates.Count -ne 1) { Start-Sleep -Milliseconds 250; continue }
+            $editor = $bodyCandidates[0]
+            $editorId = $editor.GetRuntimeId() -join ','
+            $hasEditorFocus = {
+                if ([SocOutlookWindow]::GetForegroundWindow() -ne $window) { return $false }
+                $focused = [Windows.Automation.AutomationElement]::FocusedElement
+                for ($depth = 0; $null -ne $focused -and $depth -lt 50; $depth++) {
+                    if (($focused.GetRuntimeId() -join ',') -eq $editorId) { return $true }
+                    $focused = [Windows.Automation.TreeWalker]::RawViewWalker.GetParent($focused)
+                }
+                return $false
+            }
+            $clipboardReady = $false
+            for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                try {
+                    [Windows.Forms.Clipboard]::SetText($Body)
+                    if ([Windows.Forms.Clipboard]::GetText() -ceq $Body) { $clipboardReady = $true; break }
+                } catch {}
+                Start-Sleep -Milliseconds 100
+            }
+            if (-not $clipboardReady) { return $false }
+            $editor.SetFocus()
+            if (-not (& $hasEditorFocus)) { return $false }
+            [Windows.Forms.SendKeys]::SendWait('^a')
+            if (-not (& $hasEditorFocus) -or [Windows.Forms.Clipboard]::GetText() -cne $Body) { return $false }
+            [Windows.Forms.SendKeys]::SendWait('^v')
+            # Check what the editor exposes after pasting. Never retry a paste.
+            $expected = ($Body -replace '\s+', ' ').Trim()
+            for ($verifyAttempt = 0; $verifyAttempt -lt 10; $verifyAttempt++) {
+                Start-Sleep -Milliseconds 200
+                $pattern = $editor.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
+                $actual = ($pattern.DocumentRange.GetText(-1) -replace '\s+', ' ').Trim()
+                if ($actual.Contains($expected)) { return $true }
+            }
+            return $false
+        }
+        catch {
+            # A stale accessibility node can disappear while Outlook loads.
+            # After keystrokes begin, never target another editor or retry.
+            if ($null -ne $editor) { return $false }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    return $false
+}
+
+function Set-SocOutlookBody {
+    param([string]$Body, [string]$Marker)
+    $workerProcess = $null
+    try {
+        $request = [Management.Automation.PSSerializer]::Serialize(@{
+            WorkerScript = ${function:Invoke-SocOutlookBodyWorker}.ToString()
+            Body = $Body
+            Marker = $Marker
+        })
+        $bootstrap = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $xml = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))
+    $request = [Management.Automation.PSSerializer]::Deserialize($xml)
+    $worker = [scriptblock]::Create($request.WorkerScript)
+    if ((& $worker -Body $request.Body -Marker $request.Marker) -eq $true) { exit 0 }
+} catch {}
+exit 1
+'@
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
+        $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -WindowStyle Hidden -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $startInfo.RedirectStandardInput = $true
+        $workerProcess = New-Object Diagnostics.Process
+        $workerProcess.StartInfo = $startInfo
+        if (-not $workerProcess.Start()) { return $false }
+        # Case data travels over stdin, never in command arguments or source.
+        $workerProcess.StandardInput.Write([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($request)))
+        $workerProcess.StandardInput.Close()
+        if (-not $workerProcess.WaitForExit(35000)) { return $false }
+        return $workerProcess.ExitCode -eq 0
+    }
+    catch { return $false }
+    finally {
+        if ($null -ne $workerProcess) {
+            try {
+                if (-not $workerProcess.HasExited) {
+                    $workerProcess.Kill()
+                    [void]$workerProcess.WaitForExit(2000)
+                }
+            } catch {}
+            $workerProcess.Dispose()
+        }
+    }
+}
+
+
 function Open-SocTruePositiveDraft {
     param(
         [Parameter(Mandatory = $true)][string]$Subject,
         [Parameter(Mandatory = $true)][string]$Body
     )
 
-    try {
-        $outlook = New-Object -ComObject Outlook.Application -ErrorAction Stop
-    }
-    catch {
-        throw 'Classic Outlook is required for automatic sender selection and complete JSON. Open classic Outlook and add the Cyber Defense Center account, then try again.'
-    }
+    # Use the Windows email handler (including new Outlook), rather than
+    # creating a classic Outlook COM instance. This only opens a compose window.
+    $encodedSubject = [uri]::EscapeDataString($Subject)
+    $mailPrefix = 'mailto:?subject=' + $encodedSubject + '&body='
+    $mailUri = $mailPrefix + [uri]::EscapeDataString($Body)
+    $needsBodyPaste = $mailUri.Length -gt 1800
+    $bodyMarker = 'SOC-DRAFT-' + [guid]::NewGuid().ToString('N')
 
-    $senderAccount = $null
-    foreach ($account in $outlook.Session.Accounts) {
-        $accountAddress = ([string]$account.SmtpAddress).Trim()
-        if ($accountAddress -imatch '^[^@\s]+@uscyberdefensecenter\.org$') {
-            $senderAccount = $account
-            break
+    if ($needsBodyPaste) {
+        # Keep full JSON out of long mailto links. Never silently truncate it.
+        $bodyCopied = $false
+        for ($copyAttempt = 0; $copyAttempt -lt 5; $copyAttempt++) {
+            try {
+                [System.Windows.Forms.Clipboard]::SetText($Body)
+                if ([System.Windows.Forms.Clipboard]::GetText() -ceq $Body) {
+                    $bodyCopied = $true
+                    break
+                }
+            }
+            catch {
+                # Another application may briefly hold the clipboard.
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $bodyCopied) {
+            throw 'The full email body could not be copied. Close any clipboard dialog and click True Positive Email again.'
+        }
+        $pasteNotice = "Preparing email body: $bodyMarker. If automatic filling stops, replace this text with the complete body from your clipboard."
+        $mailUri = $mailPrefix + [uri]::EscapeDataString($pasteNotice)
+        if ($mailUri.Length -gt 1800) {
+            # An unusually long subject also stays out of the launch URI.
+            # Show it in a selectable text box below instead of truncating it.
+            $mailUri = 'mailto:'
         }
     }
-    if ($null -eq $senderAccount) {
-        throw 'No account ending in @uscyberdefensecenter.org is signed in to classic Outlook. Add that account in Outlook, then try again.'
+
+    Start-Process -FilePath $mailUri -ErrorAction Stop
+
+    if ($needsBodyPaste -and $mailUri -ne 'mailto:') {
+        $bodyPasted = Set-SocOutlookBody -Body $Body -Marker $bodyMarker
+        if ($bodyPasted) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                'The complete email body, including Event JSON at the bottom, was filled and checked. Choose your @uscyberdefensecenter.org account in From before sending.',
+                'True Positive Draft'
+            )
+            return
+        }
     }
 
-    # Create in the selected account's Drafts folder instead of the default mailbox.
-    $draftsFolder = $senderAccount.DeliveryStore.GetDefaultFolder(16)
-    $draft = $draftsFolder.Items.Add('IPM.Note')
-    $draft.SendUsingAccount = $senderAccount
-    $draft.Subject = $Subject
-    $draft.Body = $Body
-    $draft.Save()
-    $draft.Display($false)
+    if ($needsBodyPaste -and $mailUri -eq 'mailto:') {
+        $subjectForm = New-Object System.Windows.Forms.Form
+        $subjectForm.Text = 'True Positive Email - Subject'
+        $subjectForm.Size = New-Object System.Drawing.Size(600, 180)
+        $subjectForm.StartPosition = 'CenterScreen'
+        $subjectBox = New-Object System.Windows.Forms.TextBox
+        $subjectBox.Multiline = $true
+        $subjectBox.ReadOnly = $true
+        $subjectBox.Dock = 'Fill'
+        $subjectBox.Text = $Subject
+        $subjectForm.Controls.Add($subjectBox)
+        try {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "The subject is too long for an email link. First paste the complete body into Outlook. Then copy the subject from the next window.
+
+Choose your @uscyberdefensecenter.org account in From before sending.",
+                'True Positive Draft'
+            )
+            [void]$subjectForm.ShowDialog()
+        }
+        finally { $subjectForm.Dispose() }
+    }
+    elseif ($needsBodyPaste) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "The complete email body, including all Event JSON, is copied to your clipboard.
+
+In the new message, click inside the body, press Ctrl+A, then Ctrl+V. The subject is already filled in.
+
+Choose your @uscyberdefensecenter.org account in From before sending.",
+            'True Positive Draft - Paste Full Body'
+        )
+    }
+    else {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            'The email opened for review. Choose your @uscyberdefensecenter.org account in From before sending.',
+            'True Positive Draft'
+        )
+    }
 }
 
 
@@ -5014,7 +5542,7 @@ $stellarTab.Controls.Add($stellarButton)
 $stellarFillModeGroup = New-Object System.Windows.Forms.GroupBox
 $stellarFillModeGroup.Text = "Fill method"
 $stellarFillModeGroup.Location = New-Object System.Drawing.Point(15, 513)
-$stellarFillModeGroup.Size = New-Object System.Drawing.Size(230, 90)
+$stellarFillModeGroup.Size = New-Object System.Drawing.Size(230, 122)
 $stellarFillModeGroup.ForeColor = [System.Drawing.Color]::White
 $stellarTab.Controls.Add($stellarFillModeGroup)
 
@@ -5032,9 +5560,16 @@ $stellarClickPasteMode.Size = New-Object System.Drawing.Size(212, 22)
 $stellarClickPasteMode.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
 $stellarFillModeGroup.Controls.Add($stellarClickPasteMode)
 
+$stellarHybridMode = New-Object System.Windows.Forms.RadioButton
+$stellarHybridMode.Text = "Hybrid autofill + scripting`r`n(May crash Airtable)"
+$stellarHybridMode.Location = New-Object System.Drawing.Point(9, 61)
+$stellarHybridMode.Size = New-Object System.Drawing.Size(212, 32)
+$stellarHybridMode.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+$stellarFillModeGroup.Controls.Add($stellarHybridMode)
+
 $stellarAutofillMode = New-Object System.Windows.Forms.RadioButton
 $stellarAutofillMode.Text = "Autofill (may crash airtable)"
-$stellarAutofillMode.Location = New-Object System.Drawing.Point(9, 61)
+$stellarAutofillMode.Location = New-Object System.Drawing.Point(9, 95)
 $stellarAutofillMode.Size = New-Object System.Drawing.Size(212, 22)
 $stellarAutofillMode.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $stellarFillModeGroup.Controls.Add($stellarAutofillMode)
@@ -5046,8 +5581,8 @@ $stellarTruePositiveButton.Size = New-Object System.Drawing.Size(180, 45)
 $stellarTab.Controls.Add($stellarTruePositiveButton)
 
 $stellarTenantStatusLabel = New-Object System.Windows.Forms.Label
-$stellarTenantStatusLabel.Location = New-Object System.Drawing.Point(20, 605)
-$stellarTenantStatusLabel.Size = New-Object System.Drawing.Size(650, 28)
+$stellarTenantStatusLabel.Location = New-Object System.Drawing.Point(250, 590)
+$stellarTenantStatusLabel.Size = New-Object System.Drawing.Size(420, 42)
 $stellarTenantStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(245, 175, 100)
 $stellarTenantStatusLabel.Text = ""
 $stellarTenantStatusLabel.Visible = $false
@@ -5365,8 +5900,23 @@ $stellarButton.Add_Click({
     # Keep the JSON's original indentation and line breaks for readability.
     $stellarJsonText = Get-JsonFromText -Text $stellarText
 
+    # The initial Tab 3 paragraph already goes to Airtable. Mark its JSON as
+    # seen so Check JSON in Tab 5 stacks only additional alert paragraphs.
+    # This does not mark any IP as looked up; the first IP lookup still runs.
+    if (-not [string]::IsNullOrWhiteSpace($stellarJsonText)) {
+        [void]$caseIpDescriptionSeenJson.Add($stellarJsonText)
+    }
+
+    # Mirror only the extracted JSON in Tab 5; this does not start lookups.
+    $caseIpJsonInputBox.Text = $stellarJsonText
+
     # Get the same dynamic paragraph Stellar displays on the Overview tab.
     $stellarAlertDescription = Get-StellarAlertDescription -JsonText $stellarJsonText
+    if (-not [string]::IsNullOrWhiteSpace($stellarAlertDescription) -and
+        -not $caseIpReportDescriptions.Contains($stellarAlertDescription.Trim())) {
+        [void]$caseIpReportDescriptions.Add($stellarAlertDescription.Trim())
+    }
+    if ($caseIpResultHistory.Count -gt 0) { & $caseIpRenderReportAction }
 
     # Source IP
     if ($stellarJsonText -match '(?i)"srcip"\s*:\s*"([^"]+)"') {
@@ -5663,7 +6213,7 @@ $stellarButton.Add_Click({
     # Supports IPv4 and IPv6
     # -----------------------------
 
-    $stellarSourceHost = ""
+    $stellarSourceHost = "None"
 
     if ($stellarCaseScoreBreakdown) {
 
@@ -5692,17 +6242,25 @@ $stellarButton.Add_Click({
         $stellarSourceHost = $stellarJsonHostIP
     }
 
+    if ([string]::IsNullOrWhiteSpace($stellarSourceHost)) {
+        $stellarSourceHost = "None"
+    }
+
     # -----------------------------
     # DESTINATION HOST
     # -----------------------------
 
-    $stellarDestinationHost = ""
+    $stellarDestinationHost = "None"
 
     if ($stellarJsonDestinationIP) {
         $stellarDestinationHost = $stellarJsonDestinationIP
     }
     elseif ($stellarSourceHost) {
         $stellarDestinationHost = $stellarSourceHost
+    }
+
+    if ([string]::IsNullOrWhiteSpace($stellarDestinationHost)) {
+        $stellarDestinationHost = "None"
     }
 
     # ==========================================
@@ -5758,6 +6316,10 @@ $stellarButton.Add_Click({
         $stellarMitreTactic = $matches[2].Trim()
 
     }
+    if ($stellarMitreTactic -ieq "XDR EBA") {
+        $stellarMitreTactic = "XDR UBA"
+    }
+
     if ($stellarMitreTactic -eq "Command and Control") {
         $stellarMitreTactic = "Command & Control"
     } 
@@ -5914,6 +6476,9 @@ $stellarButton.Add_Click({
     $stellarFillMode = if ($stellarClickPasteMode.Checked) {
         'copy'
     }
+    elseif ($stellarHybridMode.Checked) {
+        'hybrid'
+    }
     elseif ($stellarAutofillMode.Checked) {
         'autofill'
     }
@@ -5922,8 +6487,17 @@ $stellarButton.Add_Click({
     }
     $stellarFinalUrl = $stellarAirtableFormUrl
 
-    if ($stellarFillMode -eq 'autofill') {
+    # Hybrid prefills only Tenant Name and Analysts.
+    $stellarHybridPrefillKeys = @(
+        'prefill_Tenant+Name%3A', 'prefill_Analyst'
+    )
+    if ($stellarFillMode -in @('autofill', 'hybrid')) {
         $stellarAutofillParameters = @($stellarParameters)
+        if ($stellarFillMode -eq 'hybrid') {
+            $stellarAutofillParameters = @($stellarParameters | Where-Object {
+                $stellarHybridPrefillKeys -contains ($_ -split '=', 2)[0]
+            })
+        }
 
 
         if ($stellarAutofillParameters.Count -gt 0) {
@@ -6106,17 +6680,25 @@ $stellarButton.Add_Click({
 
     Start-Process "chrome.exe" $stellarFinalUrl
 
-    # Scripting fills the complete Airtable text workflow. Autofill uses the
-    # same accessibility worker for the final three sections after its URL
-    # prefills load, while leaving Tenant Name and Analyst under URL control.
-    if ($stellarFillMode -in @('scripting', 'autofill') -and (
+    # Hybrid leaves only Tenant Name and Analysts under URL control,
+    # then scripts Stellar Severity onward. Autofill scripts only the final text sections.
+    if ($stellarFillMode -in @('scripting', 'autofill', 'hybrid') -and (
         $stellarJsonText -or
         $stellarDescriptionText -or
         $stellarSupportingNotesText -or
-        ($stellarFillMode -eq 'scripting' -and $airtableAdditionalTextFields.Count -gt 0)
+        ($stellarFillMode -in @('scripting', 'hybrid') -and $airtableAdditionalTextFields.Count -gt 0)
     )) {
         $airtableWorkerAdditionalFields = if ($stellarFillMode -eq 'scripting') {
             $airtableAdditionalTextFields
+        }
+        elseif ($stellarFillMode -eq 'hybrid') {
+            # Slice at Stellar Severity so scripts follow form order.
+            $stellarHybridStart = 0
+            while ($stellarHybridStart -lt $airtableAdditionalTextFields.Count -and
+                $airtableAdditionalTextFields[$stellarHybridStart].Names -notcontains 'Stellar Severity') {
+                $stellarHybridStart++
+            }
+            @($airtableAdditionalTextFields | Select-Object -Skip $stellarHybridStart)
         }
         else {
             @()
@@ -6149,17 +6731,22 @@ $stellarButton.Add_Click({
         }
         else {
             $caseIpStatusLabel.Text = "No public IP addresses were found in this case."
-            $caseIpResultsBox.Text = (
-                "No public IP addresses were sent to external services.`r`n" +
-                "Private and reserved addresses remain listed above.`r`n" +
-                "Potential IPs are held for the Run Potential IPs button."
-            )
+            if ($caseIpResultHistory.Count -eq 0) {
+                $caseIpResultsBox.Text = (
+                    "No public IP addresses were sent to external services.`r`n" +
+                    "Private and reserved addresses remain listed above.`r`n" +
+                    "Potential IPs are held for the Run Potential IPs button."
+                )
+            }
         }
     }
 
     if ($stellarFillMode -eq 'copy') {
         $tabControl.SelectedTab = $airtableCopyTab
         [void]$mainForm.Activate()
+    }
+    elseif ($stellarFillMode -eq 'hybrid') {
+        $stellarTenantStatusLabel.Text = 'Hybrid opened Airtable; Tenant and Analysts use autofill; Stellar Severity onward uses script.'
     }
     elseif ($stellarFillMode -eq 'autofill') {
         $stellarTenantStatusLabel.Text = 'Autofill opened Airtable; JSON, Description, and Supporting Notes are being filled by script.'

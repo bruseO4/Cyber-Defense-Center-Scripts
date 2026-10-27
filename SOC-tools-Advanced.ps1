@@ -6138,6 +6138,9 @@ $stellarButton.Add_Click({
 
     $stellarText = $stellarTextBox.Text
 
+    # Start each Airtable fill with a clean Tab 5 IP search and report.
+    & $caseIpClearAction
+
     # Only refresh and query case IPs when the parser-tab checkbox is checked.
     if ($stellarRunCaseIpLookupCheckBox.Checked) {
         & $caseIpRefreshAction -Text $stellarText

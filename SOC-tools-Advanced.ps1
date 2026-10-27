@@ -101,7 +101,7 @@ public static class AirtableNativeWindow
         [pscustomobject]@{
             Names = @("Description:", "Description")
             Value = $DescriptionText
-            Order = 101
+            Order = 103
             Complete = [string]::IsNullOrWhiteSpace($DescriptionText)
         }
         [pscustomobject]@{
@@ -145,8 +145,8 @@ public static class AirtableNativeWindow
         $airtableNextOrder++
     }
 
-    # Follow the form from Tenant Name and Analysts down through JSON,
-    # Description, and Supporting Notes.
+    # Fill Description last so later fields cannot interrupt its rich-text
+    # paste or replace the clipboard while Chrome is still consuming it.
     $airtableFieldTargets = @($airtableFieldTargets | Sort-Object Order)
     $airtableAnalystLabelBounds = $null
     $airtableFirstAnalystSelected = $false
@@ -175,6 +175,72 @@ public static class AirtableNativeWindow
             Start-Sleep -Milliseconds 75
         }
 
+        return $false
+    }
+
+    $readAirtableEditorText = {
+        param($Element)
+        try {
+            $pattern = $null
+            if ($Element.TryGetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern
+            )) {
+                return [pscustomobject]@{ Supported = $true; Text = [string]$pattern.Current.Value }
+            }
+            $pattern = $null
+            if ($Element.TryGetCurrentPattern(
+                [System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern
+            )) {
+                return [pscustomobject]@{ Supported = $true; Text = [string]$pattern.DocumentRange.GetText(-1) }
+            }
+        }
+        catch { } # Replaced editor nodes are resolved again on the next retry.
+        return [pscustomobject]@{ Supported = $false; Text = '' }
+    }
+
+    $airtableTextMatches = {
+        param([string]$Actual, [string]$Expected)
+        # Rich-text editors normalize blank lines, trailing newlines, and NBSP.
+        # Every word must survive; whitespace layout alone may differ.
+        return (($Actual -replace '\s+', ' ').Trim() -ceq
+                ($Expected -replace '\s+', ' ').Trim())
+    }
+
+    $confirmAirtableDescriptionPaste = {
+        param($Element, [string]$ExpectedText, [IntPtr]$WindowHandle)
+        $canReadText = $false
+        for ($readAttempt = 0; $readAttempt -lt 10; $readAttempt++) {
+            if (-not (& $canSendAirtableKeys $WindowHandle)) { return $false }
+            $readback = & $readAirtableEditorText $Element
+            if ($readback.Supported) {
+                $canReadText = $true
+                if (& $airtableTextMatches $readback.Text $ExpectedText) { return $true }
+            }
+            Start-Sleep -Milliseconds 150
+        }
+        # Prefer editor text over clipboard verification. A mismatch means the
+        # complete value must be pasted again, never marked complete silently.
+        if ($canReadText) { return $false }
+
+        # Some Chrome rich-text editors do not expose either readback pattern.
+        # Copy from the same focused editor; a marker prevents stale clipboard
+        # contents from falsely passing when Ctrl+C fails.
+        if (-not (& $canSendAirtableKeys $WindowHandle) -or
+            -not $Element.Current.HasKeyboardFocus) { return $false }
+        $marker = 'SOC description verification ' + [Guid]::NewGuid().ToString()
+        if (-not (& $setAirtableClipboardText $marker)) { return $false }
+        if (-not (& $canSendAirtableKeys $WindowHandle) -or
+            -not $Element.Current.HasKeyboardFocus) { return $false }
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        if (-not (& $canSendAirtableKeys $WindowHandle)) { return $false }
+        [System.Windows.Forms.SendKeys]::SendWait('^c')
+        for ($copyAttempt = 0; $copyAttempt -lt 6; $copyAttempt++) {
+            Start-Sleep -Milliseconds 150
+            if (-not (& $canSendAirtableKeys $WindowHandle)) { return $false }
+            if (& $airtableTextMatches ([System.Windows.Forms.Clipboard]::GetText()) $ExpectedText) {
+                return $true
+            }
+        }
         return $false
     }
 
@@ -459,6 +525,48 @@ public static class AirtableNativeWindow
         }
 
         return $bestButton
+    }
+
+    # Rich-text Description may expose its label separately from an unnamed
+    # contenteditable editor. Resolve only within the label's nearest container;
+    # never choose the next field or a toolbar button by screen position alone.
+    $findAirtableDescriptionEditor = {
+        param($LabelElement)
+
+        $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+        $container = $LabelElement
+        for ($level = 0; $level -lt 4; $level++) {
+            try {
+                $container = $walker.GetParent($container)
+                if ($null -eq $container) { break }
+                $nodes = $container.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    [System.Windows.Automation.Condition]::TrueCondition
+                )
+                $editors = @()
+                $otherField = $false
+                for ($nodeIndex = 0; $nodeIndex -lt $nodes.Count; $nodeIndex++) {
+                    $node = $nodes.Item($nodeIndex)
+                    $name = [string]$node.Current.Name
+                    if ($name -match '(?i)^\s*(Supporting Notes|JSON of the event)\s*:?\s*\*?\s*$') {
+                        $otherField = $true
+                    }
+                    if (-not $node.Current.IsEnabled -or -not $node.Current.IsKeyboardFocusable) { continue }
+                    if ($node.Current.ControlType -notin @(
+                        [System.Windows.Automation.ControlType]::Edit,
+                        [System.Windows.Automation.ControlType]::Document
+                    )) { continue }
+                    # Exclude editor toolbar inputs such as a link URL box.
+                    if ($name -and $name -notmatch '(?i)^\s*(Description\s*:?\s*\*?|Rich text editor)\s*$') { continue }
+                    $editors += $node
+                }
+                if ($otherField) { break }
+                if ($editors.Count -eq 1) { return $editors[0] }
+                if ($editors.Count -gt 1) { break }
+            }
+            catch { break }
+        }
+        return $null
     }
 
     $openAirtableDropdown = {
@@ -850,16 +958,45 @@ public static class AirtableNativeWindow
                             continue
                         }
 
+                        # Description's accessible name may belong to its label
+                        # rather than the rich-text editor. Resolve that editor
+                        # before the normal named-input path.
+                        $airtableDescriptionEditor = $null
+                        if ($airtableFieldTarget.Names -icontains 'Description:') {
+                            for ($labelIndex = 0; $labelIndex -lt $airtableElements.Count; $labelIndex++) {
+                                try {
+                                    $label = $airtableElements.Item($labelIndex)
+                                    if ($label.Current.Name -notmatch '(?i)^\s*Description\s*:?\s*\*?\s*$') { continue }
+                                    if ($label.Current.IsKeyboardFocusable -and $label.Current.ControlType -in @(
+                                        [System.Windows.Automation.ControlType]::Edit,
+                                        [System.Windows.Automation.ControlType]::Document
+                                    )) {
+                                        $airtableDescriptionEditor = $label
+                                    }
+                                    else {
+                                        $airtableDescriptionEditor = & $findAirtableDescriptionEditor $label
+                                    }
+                                    if ($null -ne $airtableDescriptionEditor) { break }
+                                }
+                                catch { }
+                            }
+                            if ($null -eq $airtableDescriptionEditor) { continue }
+                        }
+
                         for (
                             $airtableIndex = 0;
                             $airtableIndex -lt $airtableElements.Count;
                             $airtableIndex++
                         ) {
                             $airtableElement = $airtableElements.Item($airtableIndex)
+                            if ($null -ne $airtableDescriptionEditor) {
+                                $airtableElement = $airtableDescriptionEditor
+                            }
 
                             try {
                                 if (
-                                    $airtableFieldTarget.Names -inotcontains $airtableElement.Current.Name -or
+                                    ($null -eq $airtableDescriptionEditor -and
+                                     $airtableFieldTarget.Names -inotcontains $airtableElement.Current.Name) -or
                                     -not $airtableElement.Current.IsEnabled -or
                                     -not $airtableElement.Current.IsKeyboardFocusable
                                 ) {
@@ -873,8 +1010,17 @@ public static class AirtableNativeWindow
                                     break
                                 }
 
+                                $scrollPattern = $null
+                                if ($airtableElement.TryGetCurrentPattern(
+                                    [System.Windows.Automation.ScrollItemPattern]::Pattern,
+                                    [ref]$scrollPattern
+                                )) {
+                                    $scrollPattern.ScrollIntoView()
+                                }
                                 $airtableElement.SetFocus()
                                 Start-Sleep -Milliseconds 75
+                                if ($null -ne $airtableDescriptionEditor -and
+                                    -not $airtableElement.Current.HasKeyboardFocus) { break }
 
                                 if (-not (& $canSendAirtableKeys $airtableWindowHandle)) {
                                     break
@@ -889,6 +1035,23 @@ public static class AirtableNativeWindow
 
                                 [System.Windows.Forms.SendKeys]::SendWait("^v")
                                 Start-Sleep -Milliseconds 100
+
+                                if ($null -ne $airtableDescriptionEditor) {
+                                    if (-not (& $confirmAirtableDescriptionPaste `
+                                        $airtableElement $airtableFieldTarget.Value $airtableWindowHandle)) {
+                                        break
+                                    }
+                                    # Commit the rich-text edit only after every overview
+                                    # and the normal template have been read back in full.
+                                    if (-not (& $canSendAirtableKeys $airtableWindowHandle)) { break }
+                                    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+                                    Start-Sleep -Milliseconds 400
+                                    $committedDescription = & $readAirtableEditorText $airtableElement
+                                    if ($committedDescription.Supported -and
+                                        -not (& $airtableTextMatches $committedDescription.Text $airtableFieldTarget.Value)) {
+                                        break
+                                    }
+                                }
 
                                 $airtableFieldTarget.Complete = $true
                                 break
@@ -923,6 +1086,12 @@ public static class AirtableNativeWindow
         }).Count -gt 0
     ) {
         return 'TenantNameNotFilled'
+    }
+
+    if (@($airtableFieldTargets | Where-Object {
+        -not $_.Complete -and $_.Names -icontains 'Description:'
+    }).Count -gt 0) {
+        return 'DescriptionNotFilled'
     }
 
     return $false
@@ -1010,6 +1179,7 @@ try {
     if ($pasted -eq 'AnalystAddNotFound') { exit 3 }
     if ($pasted -eq 'AirtableFocusLost') { exit 4 }
     if ($pasted -eq 'AnalystSearchNotFocused') { exit 5 }
+    if ($pasted -eq 'DescriptionNotFilled') { exit 6 }
     exit 1
 }
 catch {
@@ -1060,6 +1230,10 @@ catch {
         }
         if ($airtableWorkerProcess.ExitCode -eq 5) {
             return 'AnalystSearchNotFocused'
+        }
+
+        if ($airtableWorkerProcess.ExitCode -eq 6) {
+            return 'DescriptionNotFilled'
         }
 
         return ($airtableWorkerProcess.ExitCode -eq 0)
@@ -1236,6 +1410,94 @@ function Get-JsonFromText {
 # Stellar uses xdr_event.description for the dynamic paragraph displayed on an
 # alert's Overview tab. Read every unique occurrence from the copied JSON so the
 # paragraph can be added to Airtable without switching browser tabs.
+# Read each complete pasted JSON in order. Arrays are treated as separate
+# alert records so a later record can never supply the primary SIP or DIP.
+function Get-StellarJsonEntries {
+    param([string]$Text)
+    $remaining = $Text
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    while (-not [string]::IsNullOrWhiteSpace($remaining)) {
+        $block = Get-JsonFromText -Text $remaining
+        if ([string]::IsNullOrWhiteSpace($block)) { break }
+        $jsonValues = @($block)
+        if ($block.TrimStart().StartsWith('[')) {
+            $records = ConvertFrom-Json -InputObject $block -ErrorAction Stop
+            $jsonValues = @(
+                foreach ($record in $records) {
+                    if ($null -ne $record -and $record -is [System.Management.Automation.PSCustomObject]) {
+                        ConvertTo-Json -InputObject $record -Depth 100
+                    }
+                }
+            )
+        }
+        foreach ($json in $jsonValues) {
+            if ($seen.Add($json)) {
+                [pscustomobject]@{
+                    Json = $json
+                    Description = Get-StellarAlertDescription -JsonText $json
+                }
+            }
+        }
+        $end = $remaining.IndexOf($block, [StringComparison]::Ordinal) + $block.Length
+        $remaining = $remaining.Substring($end)
+    }
+}
+
+# Read only Stellar overview string fields directly from the pasted text.
+# A complete description remains usable even when its surrounding event cannot
+# be converted (for example, a truncated final record or conflicting key names).
+# The event JSON and identity fields still require the existing valid-JSON parser.
+function Get-StellarOverviewDescriptions {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+
+    $tokens = [regex]::Matches($Text, '"(?:\\.|[^"\\])*"|[{}\[\]:,]')
+    $contexts = New-Object System.Collections.Stack
+    $pendingProperty = ''
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = $tokens[$index].Value
+        if ($token -eq '{' -or $token -eq '[') {
+            $contexts.Push([pscustomobject]@{ Property = $pendingProperty; Kind = $token })
+            $pendingProperty = ''
+            continue
+        }
+        if ($token -eq '}' -or $token -eq ']') {
+            if ($contexts.Count) { [void]$contexts.Pop() }
+            $pendingProperty = ''
+            continue
+        }
+        if ($token -eq ',') { $pendingProperty = ''; continue }
+        if (-not $token.StartsWith('"')) { continue }
+
+        # Require an actual colon after a key or before a string value. This
+        # avoids treating quoted prose elsewhere in the copied case as JSON.
+        $afterToken = $tokens[$index].Index + $tokens[$index].Length
+        if ($index + 1 -lt $tokens.Count -and $tokens[$index + 1].Value -eq ':' -and
+            $Text.Substring($afterToken, $tokens[$index + 1].Index - $afterToken) -match '^\s*$') {
+            try { $pendingProperty = (ConvertFrom-Json -InputObject ('{"value":' + $token + '}') -ErrorAction Stop).value }
+            catch { $pendingProperty = '' }
+            continue
+        }
+        if ($index -eq 0 -or $tokens[$index - 1].Value -ne ':') { continue }
+        $beforeToken = $tokens[$index - 1].Index + 1
+        if ($Text.Substring($beforeToken, $tokens[$index].Index - $beforeToken) -notmatch '^\s*$') { continue }
+        $isOverview = $pendingProperty -ieq 'xdr_event.description'
+        if ($pendingProperty -ieq 'description' -and $contexts.Count -gt 0 -and
+            $contexts.Peek().Property -ieq 'xdr_event' -and $contexts.Peek().Kind -eq '{') {
+            $isOverview = $true
+        }
+        if ($isOverview) {
+            try {
+                $overview = (ConvertFrom-Json -InputObject ('{"value":' + $token + '}') -ErrorAction Stop).value
+                $overview = ($overview -replace "`r?`n", "`r`n").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($overview)) { $overview }
+            }
+            catch { } # Never guess at an incomplete description string.
+        }
+        $pendingProperty = ''
+    }
+}
+
 function Get-StellarAlertDescription {
     param(
         [string]$JsonText
@@ -2816,11 +3078,6 @@ function Format-CaseIpSocReport {
     param([string[]]$Descriptions, [string[]]$IpBullets)
     if ($IpBullets.Count -eq 0) { return '' }
     $introduction = 'IP addresses extracted from the supplied alert text were reviewed using available reputation sources.'
-    $description = @($Descriptions | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
-    if ($description.Count) {
-        $text = ConvertTo-IpLookupSingleLine $description[0] -MaximumLength 0
-        $introduction = ($text -split '(?<=[.!?])\s+(?=[A-Z])', 2)[0]
-    }
     if (@($IpBullets | Where-Object { $_ -match ' - (Suspicious|Malicious reputation) - ' }).Count) {
         $conclusion = 'Reported threat or abuse indicators require correlation with the observed alert activity. The available evidence does not establish a case verdict.'
     }
@@ -2832,7 +3089,8 @@ function Format-CaseIpSocReport {
     }
     else { $conclusion = 'Private or reserved IPs have no public reputation assessment. Verify the alert activity before determining a case verdict.' }
     # IP reputation alone cannot establish whether the alert is a TP or FP.
-    return ((@($introduction, ($IpBullets -join "`r`n"), $conclusion) -join "`r`n`r`n") -replace '[\u2013\u2014]', '-' -replace '[`*]', '')
+    $ipSeparator = "`r`n`r`n" + ('-' * 72) + "`r`n`r`n"
+    return ((@($introduction, ($IpBullets -join $ipSeparator), $conclusion) -join "`r`n`r`n") -replace '[\u2013\u2014]', '-' -replace '[`*]', '')
 }
 
 function Enable-IpBulletClickToCopy {
@@ -4634,7 +4892,7 @@ $stellarAnalysts = @(
 # ==========================================
 
 $stellarLabel = New-Object System.Windows.Forms.Label
-$stellarLabel.Text = "Paste the Stellar alert information below:"
+$stellarLabel.Text = "Paste Stellar alert text and additional JSONs below:"
 $stellarLabel.Location = New-Object System.Drawing.Point(20, 20)
 $stellarLabel.Size = New-Object System.Drawing.Size(500, 25)
 $stellarTab.Controls.Add($stellarLabel) 
@@ -4647,6 +4905,7 @@ $stellarTextBox = New-Object System.Windows.Forms.TextBox
 $stellarTextBox.Location = New-Object System.Drawing.Point(20, 50)
 $stellarTextBox.Size = New-Object System.Drawing.Size(640, 360)
 $stellarTextBox.Multiline = $true
+$stellarTextBox.AcceptsReturn = $true
 $stellarTextBox.ScrollBars = "Vertical"
 $stellarTab.Controls.Add($stellarTextBox)
 
@@ -4828,29 +5087,24 @@ $caseIpDescriptionPanel.Controls.Add($caseIpDescriptionBox)
 
 $caseIpDescriptionHistory = New-Object System.Collections.Generic.List[string]
 $caseIpDescriptionSeenJson = New-Object System.Collections.Generic.HashSet[string]
-# Report context is separate from the extra paragraphs copied to Airtable.
+# Retain all overview paragraphs in the Description area above the IP report.
 $caseIpReportDescriptions = New-Object System.Collections.Generic.List[string]
 $caseIpRefreshDescriptionAction = {
     param([string]$Text)
-    # Read every complete JSON block, including a second object pasted after
-    # the first. Advance past each whole value so nested records are not repeated.
-    $caseIpRemainingDescriptionText = $Text
-    while (-not [string]::IsNullOrWhiteSpace($caseIpRemainingDescriptionText)) {
-        $caseIpDescriptionJson = Get-JsonFromText -Text $caseIpRemainingDescriptionText
-        if ([string]::IsNullOrWhiteSpace($caseIpDescriptionJson)) { break }
-        $caseIpIncomingDescription = Get-StellarAlertDescription -JsonText $caseIpDescriptionJson
+    # Rebuild from this pasted case so clicking Description copies exactly its
+    # overview paragraphs, including repeated text, in their original order.
+    $caseIpDescriptionHistory.Clear()
+    $caseIpDescriptionSeenJson.Clear()
+    $caseIpReportDescriptions.Clear()
+    foreach ($caseIpIncomingDescription in @(Get-StellarOverviewDescriptions -Text $Text)) {
+        $caseIpDescriptionJson = $caseIpIncomingDescription
         if (-not [string]::IsNullOrWhiteSpace($caseIpIncomingDescription) -and
             -not $caseIpReportDescriptions.Contains($caseIpIncomingDescription.Trim())) {
             [void]$caseIpReportDescriptions.Add($caseIpIncomingDescription.Trim())
         }
-        if (-not [string]::IsNullOrWhiteSpace($caseIpIncomingDescription) -and
-            $caseIpDescriptionSeenJson.Add($caseIpDescriptionJson)) {
+        if (-not [string]::IsNullOrWhiteSpace($caseIpIncomingDescription)) {
             [void]$caseIpDescriptionHistory.Add($caseIpIncomingDescription.Trim())
         }
-        $caseIpDescriptionEnd = $caseIpRemainingDescriptionText.IndexOf(
-            $caseIpDescriptionJson, [StringComparison]::Ordinal
-        ) + $caseIpDescriptionJson.Length
-        $caseIpRemainingDescriptionText = $caseIpRemainingDescriptionText.Substring($caseIpDescriptionEnd)
     }
     $caseIpDescriptionPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, 0)
     $caseIpDescriptionBox.Text = $caseIpDescriptionHistory -join "`r`n`r`n"
@@ -4859,7 +5113,7 @@ $caseIpRefreshDescriptionAction = {
     $caseIpDescriptionLabel.Enabled = -not [string]::IsNullOrWhiteSpace($caseIpDescriptionBox.Text)
 }
 
-# Descriptions accumulate only when Check JSON is explicitly selected.
+# Descriptions accumulate on Check JSON or when additional Tab 3 JSONs are processed.
 
 # The title, text, and unused space in the panel all support hover and copy.
 foreach ($caseIpDescriptionControl in @($caseIpDescriptionLabel, $caseIpDescriptionPanel, $caseIpDescriptionBox)) {
@@ -5431,7 +5685,7 @@ function Open-SocTruePositiveDraft {
         if (-not $bodyCopied) {
             throw 'The full email body could not be copied. Close any clipboard dialog and click True Positive Email again.'
         }
-        $pasteNotice = "Preparing email body: $bodyMarker. If automatic filling stops, replace this text with the complete body from your clipboard."
+        $pasteNotice = "Preparing the complete email draft: $bodyMarker. If automatic filling stops, click the email body and press Ctrl+A, then Ctrl+V to paste the complete draft."
         $mailUri = $mailPrefix + [uri]::EscapeDataString($pasteNotice)
         if ($mailUri.Length -gt 1800) {
             # An unusually long subject also stays out of the launch URI.
@@ -5739,7 +5993,11 @@ $stellarTruePositiveButton.Add_Click({
         return
     }
 
-    $caseJson = Get-JsonFromText -Text $caseText
+    $emailJsonEntries = @(Get-StellarJsonEntries -Text $caseText)
+    $caseJson = ''
+    if ($emailJsonEntries.Count -gt 0) {
+        $caseJson = $emailJsonEntries[0].Json
+    }
     $emailIssue = Get-StellarIssueForEmail -CaseText $caseText -JsonText $caseJson
     $emailCaseNumber = ''
     $caseNumberMatch = [regex]::Match(
@@ -5760,7 +6018,7 @@ $stellarTruePositiveButton.Add_Click({
         $emailSubject = "$emailCaseNumber`: $emailIssue"
     }
 
-    $caseDescription = Get-StellarAlertDescription -JsonText $caseJson
+    $caseDescription = @(Get-StellarOverviewDescriptions -Text $caseText) -join "`r`n`r`n"
     if (-not $caseDescription) {
         $caseDescription = '[Add case description here]'
     }
@@ -5853,8 +6111,13 @@ $stellarTruePositiveButton.Add_Click({
     }
 
     try {
-        $emailDescriptionPlaceholder = 'Paste the rest of the description here'
-        $emailBody = "Tenant Name: $emailTenantName`r`n$caseUrl`r`n`r`n$caseDescription`r`n`r`n$emailDescriptionPlaceholder`r`n`r`nRecommendation:`r`n`r`nEvent JSON:`r`n$formattedJson"
+        $stellarEmailLinkLabel = if ($emailCaseNumber) {
+            "Stellar Link ($emailCaseNumber):"
+        }
+        else {
+            'Stellar Link:'
+        }
+        $emailBody = "Tenant Name: $emailTenantName`r`n$stellarEmailLinkLabel $caseUrl`r`n`r`n$caseDescription`r`n`r`nRecommendation:`r`n`r`nEvent JSON:`r`n$formattedJson"
         Open-SocTruePositiveDraft -Subject $emailSubject -Body $emailBody
     }
     catch {
@@ -5896,49 +6159,43 @@ $stellarButton.Add_Click({
     $stellarJsonUser = ""
     $stellarAlertDescription = ""
 
-    # Isolate one valid JSON value without capturing Overview or another object.
-    # Keep the JSON's original indentation and line breaks for readability.
-    $stellarJsonText = Get-JsonFromText -Text $stellarText
-
-    # The initial Tab 3 paragraph already goes to Airtable. Mark its JSON as
-    # seen so Check JSON in Tab 5 stacks only additional alert paragraphs.
-    # This does not mark any IP as looked up; the first IP lookup still runs.
-    if (-not [string]::IsNullOrWhiteSpace($stellarJsonText)) {
-        [void]$caseIpDescriptionSeenJson.Add($stellarJsonText)
+    $stellarJsonEntries = @(Get-StellarJsonEntries -Text $stellarText)
+    $stellarPrimaryJsonText = ''
+    if ($stellarJsonEntries.Count -gt 0) {
+        $stellarPrimaryJsonText = $stellarJsonEntries[0].Json
     }
+    # Airtable's event JSON and identity fields always use the first record.
+    # Keep all records separately for description overviews and IP lookups.
+    $stellarJsonText = $stellarPrimaryJsonText
+    $stellarAllJsonText = @($stellarJsonEntries | ForEach-Object { $_.Json }) -join "`r`n`r`n"
+    $stellarAlertDescription = @(Get-StellarOverviewDescriptions -Text $stellarText) -join "`r`n`r`n"
 
-    # Mirror only the extracted JSON in Tab 5; this does not start lookups.
-    $caseIpJsonInputBox.Text = $stellarJsonText
-
-    # Get the same dynamic paragraph Stellar displays on the Overview tab.
-    $stellarAlertDescription = Get-StellarAlertDescription -JsonText $stellarJsonText
-    if (-not [string]::IsNullOrWhiteSpace($stellarAlertDescription) -and
-        -not $caseIpReportDescriptions.Contains($stellarAlertDescription.Trim())) {
-        [void]$caseIpReportDescriptions.Add($stellarAlertDescription.Trim())
-    }
+    # Display and copy every overview together under Description on Tab 5.
+    # Retain the original paste so an unconvertible final event cannot hide its overview.
+    $caseIpJsonInputBox.Text = $stellarText
+    & $caseIpRefreshDescriptionAction -Text $stellarText
     if ($caseIpResultHistory.Count -gt 0) { & $caseIpRenderReportAction }
-
     # Source IP
-    if ($stellarJsonText -match '(?i)"srcip"\s*:\s*"([^"]+)"') {
+    if ($stellarPrimaryJsonText -match '(?i)"srcip"\s*:\s*"([^"]+)"') {
         $stellarJsonSourceIP = $matches[1].Trim()
     }
 
     # Destination IP
-    if ($stellarJsonText -match '(?i)"dstip"\s*:\s*"([^"]+)"') {
+    if ($stellarPrimaryJsonText -match '(?i)"dstip"\s*:\s*"([^"]+)"') {
         $stellarJsonDestinationIP = $matches[1].Trim()
     }
 
     # Host IP fallback
-    if ($stellarJsonText -match '(?i)"hostip"\s*:\s*"([^"]+)"') {
+    if ($stellarPrimaryJsonText -match '(?i)"hostip"\s*:\s*"([^"]+)"') {
         $stellarJsonHostIP = $matches[1].Trim()
     }
 
     # User fallback for alerts whose Case Score Breakdown did not load.
     # Prefer engid_name, then use computer_name when engid_name is unavailable.
-    if ($stellarJsonText -match '(?i)"engid_name"\s*:\s*"([^"]+)"') {
+    if ($stellarPrimaryJsonText -match '(?i)"engid_name"\s*:\s*"([^"]+)"') {
         $stellarJsonUser = $matches[1].Trim()
     }
-    elseif ($stellarJsonText -match '(?i)"computer_name"\s*:\s*"([^"]+)"') {
+    elseif ($stellarPrimaryJsonText -match '(?i)"computer_name"\s*:\s*"([^"]+)"') {
         $stellarJsonUser = $matches[1].Trim()
     }
 
@@ -6002,10 +6259,10 @@ $stellarButton.Add_Click({
 
     # If the visible page did not include Run Analysis, use Stellar's official
     # JSON display-name field as the Issue. This only runs while Issue is blank.
-    if (-not $stellarIssue -and $stellarJsonText) {
+    if (-not $stellarIssue -and $stellarPrimaryJsonText) {
         try {
             $stellarIssueJson = ConvertFrom-Json `
-                -InputObject $stellarJsonText `
+                -InputObject $stellarPrimaryJsonText `
                 -ErrorAction Stop
 
             foreach ($stellarIssueJsonRecord in @($stellarIssueJson)) {
@@ -6719,6 +6976,9 @@ $stellarButton.Add_Click({
         elseif ($airtableFillResult -eq 'AnalystSearchNotFocused') {
             $stellarTenantStatusLabel.Text = "Add application was clicked, but the Analyst search field did not receive focus."
         }
+        elseif ($airtableFillResult -eq 'DescriptionNotFilled') {
+            $stellarTenantStatusLabel.Text = "Airtable's Description editor could not be filled; use Airtable Copy for the complete description."
+        }
         elseif ($airtableFillResult -eq 'AirtableFocusLost') {
             $stellarTenantStatusLabel.Text = "Airtable filling stopped when Chrome lost focus."
         }
@@ -6745,10 +7005,10 @@ $stellarButton.Add_Click({
         $tabControl.SelectedTab = $airtableCopyTab
         [void]$mainForm.Activate()
     }
-    elseif ($stellarFillMode -eq 'hybrid') {
+    elseif ($stellarFillMode -eq 'hybrid' -and $airtableFillResult -eq $true) {
         $stellarTenantStatusLabel.Text = 'Hybrid opened Airtable; Tenant and Analysts use autofill; Stellar Severity onward uses script.'
     }
-    elseif ($stellarFillMode -eq 'autofill') {
+    elseif ($stellarFillMode -eq 'autofill' -and $airtableFillResult -eq $true) {
         $stellarTenantStatusLabel.Text = 'Autofill opened Airtable; JSON, Description, and Supporting Notes are being filled by script.'
     }
 
@@ -6785,11 +7045,7 @@ $stellarTextBox.Add_KeyDown({
         $_.SuppressKeyPress = $true
     }
 
-    # Enter runs the Fill Airtable button
-    elseif ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
-        $stellarButton.PerformClick()
-        $_.SuppressKeyPress = $true
-    }
+    # Enter adds a newline. Fill Airtable runs only from its button.
 
 })
 
@@ -6826,7 +7082,7 @@ $tabControl.Add_SelectedIndexChanged({
         $ipTextBox.Focus()
     }
     elseif ($tabControl.SelectedTab -eq $stellarTab) {
-        $mainForm.AcceptButton = $stellarButton
+        $mainForm.AcceptButton = $null
         $stellarTextBox.Focus()
     }
     elseif ($tabControl.SelectedTab -eq $caseIpTab) {

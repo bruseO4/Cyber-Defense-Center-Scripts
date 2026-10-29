@@ -4905,6 +4905,8 @@ $stellarTextBox = New-Object System.Windows.Forms.TextBox
 $stellarTextBox.Location = New-Object System.Drawing.Point(20, 50)
 $stellarTextBox.Size = New-Object System.Drawing.Size(640, 360)
 $stellarTextBox.Multiline = $true
+# Allow large alert text and multiple complete JSON records.
+$stellarTextBox.MaxLength = 0
 $stellarTextBox.AcceptsReturn = $true
 $stellarTextBox.ScrollBars = "Vertical"
 $stellarTab.Controls.Add($stellarTextBox)
@@ -5512,8 +5514,32 @@ foreach ($stellarAnalyst in $stellarAnalysts) {
 # FILL AIRTABLE BUTTON
 # ==========================================
 
+function New-SocOutlookHtmlClipboard {
+    param([string]$Body, [string]$LinkUrl, [string]$LinkLabel)
+    $safeBody = [System.Web.HttpUtility]::HtmlEncode($Body)
+    if (-not [string]::IsNullOrWhiteSpace($LinkUrl) -and
+        -not [string]::IsNullOrWhiteSpace($LinkLabel)) {
+        $safeLabel = [System.Web.HttpUtility]::HtmlEncode($LinkLabel)
+        $safeUrl = [System.Web.HttpUtility]::HtmlAttributeEncode($LinkUrl)
+        $safeBody = $safeBody.Replace(
+            $safeLabel,
+            "<a href=`"$safeUrl`">$safeLabel</a>"
+        )
+    }
+    $htmlPrefix = '<html><body><!--StartFragment--><pre style="font-family:Calibri,Arial,sans-serif;white-space:pre-wrap">'
+    $htmlSuffix = '</pre><!--EndFragment--></body></html>'
+    $fragment = $htmlPrefix + $safeBody + $htmlSuffix
+    $utf8 = [System.Text.Encoding]::UTF8
+    $headerTemplate = "Version:0.9`r`nStartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n"
+    $headerLength = $utf8.GetByteCount(($headerTemplate -f 0, 0, 0, 0))
+    $startFragment = $headerLength + $utf8.GetByteCount($htmlPrefix)
+    $endFragment = $startFragment + $utf8.GetByteCount($safeBody)
+    $endHtml = $headerLength + $utf8.GetByteCount($fragment)
+    return ($headerTemplate -f $headerLength, $endHtml, $startFragment, $endFragment) + $fragment
+}
+
 function Invoke-SocOutlookBodyWorker {
-    param([string]$Body, [string]$Marker, [int]$TimeoutSeconds = 25)
+    param([string]$Body, [string]$Marker, [string]$HtmlClipboard, [int]$TimeoutSeconds = 25)
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
     Add-Type -AssemblyName System.Windows.Forms
@@ -5571,8 +5597,19 @@ public static class SocOutlookWindow {
             $clipboardReady = $false
             for ($attempt = 0; $attempt -lt 5; $attempt++) {
                 try {
-                    [Windows.Forms.Clipboard]::SetText($Body)
-                    if ([Windows.Forms.Clipboard]::GetText() -ceq $Body) { $clipboardReady = $true; break }
+                    $dataObject = New-Object Windows.Forms.DataObject
+                    $dataObject.SetText($Body, [Windows.Forms.TextDataFormat]::UnicodeText)
+                    if (-not [string]::IsNullOrWhiteSpace($HtmlClipboard)) {
+                        $dataObject.SetData('HTML Format', $false, $HtmlClipboard)
+                    }
+                    [Windows.Forms.Clipboard]::SetDataObject($dataObject, $true)
+                    $clipboardReadback = [Windows.Forms.Clipboard]::GetDataObject()
+                    $textMatches = [Windows.Forms.Clipboard]::GetText() -ceq $Body
+                    $htmlMatches = (
+                        [string]::IsNullOrWhiteSpace($HtmlClipboard) -or
+                        [string]$clipboardReadback.GetData('HTML Format') -ceq $HtmlClipboard
+                    )
+                    if ($textMatches -and $htmlMatches) { $clipboardReady = $true; break }
                 } catch {}
                 Start-Sleep -Milliseconds 100
             }
@@ -5581,6 +5618,10 @@ public static class SocOutlookWindow {
             if (-not (& $hasEditorFocus)) { return $false }
             [Windows.Forms.SendKeys]::SendWait('^a')
             if (-not (& $hasEditorFocus) -or [Windows.Forms.Clipboard]::GetText() -cne $Body) { return $false }
+            if (-not [string]::IsNullOrWhiteSpace($HtmlClipboard)) {
+                $clipboardReadback = [Windows.Forms.Clipboard]::GetDataObject()
+                if ([string]$clipboardReadback.GetData('HTML Format') -cne $HtmlClipboard) { return $false }
+            }
             [Windows.Forms.SendKeys]::SendWait('^v')
             # Check what the editor exposes after pasting. Never retry a paste.
             $expected = ($Body -replace '\s+', ' ').Trim()
@@ -5603,13 +5644,14 @@ public static class SocOutlookWindow {
 }
 
 function Set-SocOutlookBody {
-    param([string]$Body, [string]$Marker)
+    param([string]$Body, [string]$Marker, [string]$HtmlClipboard)
     $workerProcess = $null
     try {
         $request = [Management.Automation.PSSerializer]::Serialize(@{
             WorkerScript = ${function:Invoke-SocOutlookBodyWorker}.ToString()
             Body = $Body
             Marker = $Marker
+            HtmlClipboard = $HtmlClipboard
         })
         $bootstrap = @'
 $ErrorActionPreference = 'Stop'
@@ -5617,7 +5659,7 @@ try {
     $xml = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))
     $request = [Management.Automation.PSSerializer]::Deserialize($xml)
     $worker = [scriptblock]::Create($request.WorkerScript)
-    if ((& $worker -Body $request.Body -Marker $request.Marker) -eq $true) { exit 0 }
+    if ((& $worker -Body $request.Body -Marker $request.Marker -HtmlClipboard $request.HtmlClipboard) -eq $true) { exit 0 }
 } catch {}
 exit 1
 '@
@@ -5655,7 +5697,9 @@ exit 1
 function Open-SocTruePositiveDraft {
     param(
         [Parameter(Mandatory = $true)][string]$Subject,
-        [Parameter(Mandatory = $true)][string]$Body
+        [Parameter(Mandatory = $true)][string]$Body,
+        [string]$LinkUrl = '',
+        [string]$LinkLabel = ''
     )
 
     # Use the Windows email handler (including new Outlook), rather than
@@ -5663,16 +5707,36 @@ function Open-SocTruePositiveDraft {
     $encodedSubject = [uri]::EscapeDataString($Subject)
     $mailPrefix = 'mailto:?subject=' + $encodedSubject + '&body='
     $mailUri = $mailPrefix + [uri]::EscapeDataString($Body)
-    $needsBodyPaste = $mailUri.Length -gt 1800
     $bodyMarker = 'SOC-DRAFT-' + [guid]::NewGuid().ToString('N')
+    $htmlClipboard = ''
+    $needsBodyPaste = $mailUri.Length -gt 1800
+    $hasCaseHyperlink = (
+        -not [string]::IsNullOrWhiteSpace($LinkUrl) -and
+        -not [string]::IsNullOrWhiteSpace($LinkLabel)
+    )
+    if ($hasCaseHyperlink) {
+        $needsBodyPaste = $true
+        $htmlClipboard = New-SocOutlookHtmlClipboard -Body $Body -LinkUrl $LinkUrl -LinkLabel $LinkLabel
+    }
 
     if ($needsBodyPaste) {
         # Keep full JSON out of long mailto links. Never silently truncate it.
         $bodyCopied = $false
         for ($copyAttempt = 0; $copyAttempt -lt 5; $copyAttempt++) {
             try {
-                [System.Windows.Forms.Clipboard]::SetText($Body)
-                if ([System.Windows.Forms.Clipboard]::GetText() -ceq $Body) {
+                $dataObject = New-Object System.Windows.Forms.DataObject
+                $dataObject.SetText($Body, [System.Windows.Forms.TextDataFormat]::UnicodeText)
+                if (-not [string]::IsNullOrWhiteSpace($htmlClipboard)) {
+                    $dataObject.SetData('HTML Format', $false, $htmlClipboard)
+                }
+                [System.Windows.Forms.Clipboard]::SetDataObject($dataObject, $true)
+                $clipboardReadback = [System.Windows.Forms.Clipboard]::GetDataObject()
+                $textMatches = [System.Windows.Forms.Clipboard]::GetText() -ceq $Body
+                $htmlMatches = (
+                    [string]::IsNullOrWhiteSpace($htmlClipboard) -or
+                    [string]$clipboardReadback.GetData('HTML Format') -ceq $htmlClipboard
+                )
+                if ($textMatches -and $htmlMatches) {
                     $bodyCopied = $true
                     break
                 }
@@ -5685,7 +5749,7 @@ function Open-SocTruePositiveDraft {
         if (-not $bodyCopied) {
             throw 'The full email body could not be copied. Close any clipboard dialog and click True Positive Email again.'
         }
-        $pasteNotice = "Preparing the complete email draft: $bodyMarker. If automatic filling stops, click the email body and press Ctrl+A, then Ctrl+V to paste the complete draft."
+        $pasteNotice = "The complete alert email, including all Event JSON, is copied to your clipboard. Click inside this email body, press Ctrl+A, then Ctrl+V to replace these instructions with the complete email. Choose your @uscyberdefensecenter.org account in From before sending."
         $mailUri = $mailPrefix + [uri]::EscapeDataString($pasteNotice)
         if ($mailUri.Length -gt 1800) {
             # An unusually long subject also stays out of the launch URI.
@@ -5695,17 +5759,6 @@ function Open-SocTruePositiveDraft {
     }
 
     Start-Process -FilePath $mailUri -ErrorAction Stop
-
-    if ($needsBodyPaste -and $mailUri -ne 'mailto:') {
-        $bodyPasted = Set-SocOutlookBody -Body $Body -Marker $bodyMarker
-        if ($bodyPasted) {
-            [void][System.Windows.Forms.MessageBox]::Show(
-                'The complete email body, including Event JSON at the bottom, was filled and checked. Choose your @uscyberdefensecenter.org account in From before sending.',
-                'True Positive Draft'
-            )
-            return
-        }
-    }
 
     if ($needsBodyPaste -and $mailUri -eq 'mailto:') {
         $subjectForm = New-Object System.Windows.Forms.Form
@@ -5729,22 +5782,7 @@ Choose your @uscyberdefensecenter.org account in From before sending.",
         }
         finally { $subjectForm.Dispose() }
     }
-    elseif ($needsBodyPaste) {
-        [void][System.Windows.Forms.MessageBox]::Show(
-            "The complete email body, including all Event JSON, is copied to your clipboard.
 
-In the new message, click inside the body, press Ctrl+A, then Ctrl+V. The subject is already filled in.
-
-Choose your @uscyberdefensecenter.org account in From before sending.",
-            'True Positive Draft - Paste Full Body'
-        )
-    }
-    else {
-        [void][System.Windows.Forms.MessageBox]::Show(
-            'The email opened for review. Choose your @uscyberdefensecenter.org account in From before sending.',
-            'True Positive Draft'
-        )
-    }
 }
 
 
@@ -6112,13 +6150,14 @@ $stellarTruePositiveButton.Add_Click({
 
     try {
         $stellarEmailLinkLabel = if ($emailCaseNumber) {
-            "Stellar Link ($emailCaseNumber):"
+            "Stellar Link: $emailCaseNumber"
         }
         else {
-            'Stellar Link:'
+            'Stellar Link'
         }
-        $emailBody = "Tenant Name: $emailTenantName`r`n$stellarEmailLinkLabel $caseUrl`r`n`r`n$caseDescription`r`n`r`nRecommendation:`r`n`r`nEvent JSON:`r`n$formattedJson"
-        Open-SocTruePositiveDraft -Subject $emailSubject -Body $emailBody
+        $stellarEmailLinkUrl = if ($caseUrl -match '^https?://') { $caseUrl } else { '' }
+        $emailBody = "Tenant Name: $emailTenantName`r`n$stellarEmailLinkLabel`r`n`r`n$caseDescription`r`n`r`nRecommendation:`r`n`r`nEvent JSON:`r`n$formattedJson"
+        Open-SocTruePositiveDraft -Subject $emailSubject -Body $emailBody -LinkUrl $stellarEmailLinkUrl -LinkLabel $stellarEmailLinkLabel
     }
     catch {
         [void][System.Windows.Forms.MessageBox]::Show(
